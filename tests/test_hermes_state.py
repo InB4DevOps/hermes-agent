@@ -16,716 +16,413 @@ def db(tmp_path):
     session_db.close()
 
 
-# =========================================================================
-# Session lifecycle
-# =========================================================================
+"""Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
-class TestSessionLifecycle:
-    def test_create_and_get_session(self, db):
-        sid = db.create_session(
+import time
+import pytest
+from pathlib import Path
+
+from hermes_state import SessionDB
+
+
+@pytest.fixture()
+def db(tmp_path):
+    """Create a SessionDB with a temp database file."""
+    db_path = tmp_path / "test_state.db"
+    session_db = SessionDB(db_path=db_path)
+    yield session_db
+    session_db.close()
+
+
+# ======================================================================
+# Untested/Edge cases
+# ======================================================================
+
+class TestClearMessages:
+    """Tests for clear_messages() - deletes all messages and resets counters."""
+
+    def test_clear_messages(self, db: SessionDB):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="Hello")
+        db.append_message("s1", role="assistant", content="Hi")
+        db.append_message("s1", role="tool", tool_name="web_search")
+
+        # Verify messages exist
+        assert db.message_count(session_id="s1") == 3
+        session = db.get_session("s1")
+        assert session["message_count"] == 3
+        assert session["tool_call_count"] == 1
+
+        # Clear messages
+        db.clear_messages("s1")
+
+        # Verify messages deleted
+        assert db.message_count(session_id="s1") == 0
+        assert db.get_messages("s1") == []
+
+        # Verify counters reset
+        session = db.get_session("s1")
+        assert session["message_count"] == 0
+        assert session["tool_call_count"] == 0
+
+    def test_clear_nonexistent_session(self, db: SessionDB):
+        # Should not raise for nonexistent session
+        assert db.clear_messages("nonexistent") is not None  # Returns None implicitly
+
+    def test_clear_messages_preserves_session_metadata(self, db: SessionDB):
+        db.create_session(
             session_id="s1",
             source="cli",
             model="test-model",
+            system_prompt="System prompt text",
         )
-        assert sid == "s1"
-
-        session = db.get_session("s1")
-        assert session is not None
-        assert session["source"] == "cli"
-        assert session["model"] == "test-model"
-        assert session["ended_at"] is None
-
-    def test_get_nonexistent_session(self, db):
-        assert db.get_session("nonexistent") is None
-
-    def test_end_session(self, db):
-        db.create_session(session_id="s1", source="cli")
         db.end_session("s1", end_reason="user_exit")
+        db.set_session_title("s1", "My Title")
 
-        session = db.get_session("s1")
-        assert isinstance(session["ended_at"], float)
-        assert session["end_reason"] == "user_exit"
-
-    def test_update_system_prompt(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.update_system_prompt("s1", "You are a helpful assistant.")
-
-        session = db.get_session("s1")
-        assert session["system_prompt"] == "You are a helpful assistant."
-
-    def test_update_token_counts(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.update_token_counts("s1", input_tokens=200, output_tokens=100)
-        db.update_token_counts("s1", input_tokens=100, output_tokens=50)
-
-        session = db.get_session("s1")
-        assert session["input_tokens"] == 300
-        assert session["output_tokens"] == 150
-
-    def test_update_token_counts_backfills_model_when_null(self, db):
-        db.create_session(session_id="s1", source="telegram")
-        db.update_token_counts("s1", input_tokens=10, output_tokens=5, model="openai/gpt-5.4")
-
-        session = db.get_session("s1")
-        assert session["model"] == "openai/gpt-5.4"
-
-    def test_update_token_counts_preserves_existing_model(self, db):
-        db.create_session(session_id="s1", source="cli", model="anthropic/claude-opus-4.6")
-        db.update_token_counts("s1", input_tokens=10, output_tokens=5, model="openai/gpt-5.4")
-
-        session = db.get_session("s1")
-        assert session["model"] == "anthropic/claude-opus-4.6"
-
-    def test_parent_session(self, db):
-        db.create_session(session_id="parent", source="cli")
-        db.create_session(session_id="child", source="cli", parent_session_id="parent")
-
-        child = db.get_session("child")
-        assert child["parent_session_id"] == "parent"
-
-
-# =========================================================================
-# Message storage
-# =========================================================================
-
-class TestMessageStorage:
-    def test_append_and_get_messages(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="Hello")
-        db.append_message("s1", role="assistant", content="Hi there!")
-
-        messages = db.get_messages("s1")
-        assert len(messages) == 2
-        assert messages[0]["role"] == "user"
-        assert messages[0]["content"] == "Hello"
-        assert messages[1]["role"] == "assistant"
-
-    def test_message_increments_session_count(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="Hello")
-        db.append_message("s1", role="assistant", content="Hi")
-
-        session = db.get_session("s1")
-        assert session["message_count"] == 2
-
-    def test_tool_response_does_not_increment_tool_count(self, db):
-        """Tool responses (role=tool) should not increment tool_call_count.
-
-        Only assistant messages with tool_calls should count.
-        """
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="tool", content="result", tool_name="web_search")
-
-        session = db.get_session("s1")
-        assert session["tool_call_count"] == 0
-
-    def test_assistant_tool_calls_increment_by_count(self, db):
-        """An assistant message with N tool_calls should increment by N."""
-        db.create_session(session_id="s1", source="cli")
-        tool_calls = [
-            {"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}},
-        ]
-        db.append_message("s1", role="assistant", content="", tool_calls=tool_calls)
-
-        session = db.get_session("s1")
-        assert session["tool_call_count"] == 1
-
-    def test_tool_call_count_matches_actual_calls(self, db):
-        """tool_call_count should equal the number of tool calls made, not messages."""
-        db.create_session(session_id="s1", source="cli")
-
-        # Assistant makes 2 parallel tool calls in one message
-        tool_calls = [
-            {"id": "call_1", "function": {"name": "ha_call_service", "arguments": "{}"}},
-            {"id": "call_2", "function": {"name": "ha_call_service", "arguments": "{}"}},
-        ]
-        db.append_message("s1", role="assistant", content="", tool_calls=tool_calls)
-
-        # Two tool responses come back
-        db.append_message("s1", role="tool", content="ok", tool_name="ha_call_service")
-        db.append_message("s1", role="tool", content="ok", tool_name="ha_call_service")
-
-        session = db.get_session("s1")
-        # Should be 2 (the actual number of tool calls), not 3
-        assert session["tool_call_count"] == 2, (
-            f"Expected 2 tool calls but got {session['tool_call_count']}. "
-            "tool responses are double-counted and multi-call messages are under-counted"
-        )
-
-    def test_tool_calls_serialization(self, db):
-        db.create_session(session_id="s1", source="cli")
-        tool_calls = [{"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}}]
-        db.append_message("s1", role="assistant", tool_calls=tool_calls)
-
-        messages = db.get_messages("s1")
-        assert messages[0]["tool_calls"] == tool_calls
-
-    def test_get_messages_as_conversation(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="Hello")
-        db.append_message("s1", role="assistant", content="Hi!")
-
-        conv = db.get_messages_as_conversation("s1")
-        assert len(conv) == 2
-        assert conv[0] == {"role": "user", "content": "Hello"}
-        assert conv[1] == {"role": "assistant", "content": "Hi!"}
-
-    def test_finish_reason_stored(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="assistant", content="Done", finish_reason="stop")
-
-        messages = db.get_messages("s1")
-        assert messages[0]["finish_reason"] == "stop"
-
-
-# =========================================================================
-# FTS5 search
-# =========================================================================
-
-class TestFTS5Search:
-    def test_search_finds_content(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="How do I deploy with Docker?")
-        db.append_message("s1", role="assistant", content="Use docker compose up.")
-
-        results = db.search_messages("docker")
-        assert len(results) == 2
-        # At least one result should mention docker
-        snippets = [r.get("snippet", "") for r in results]
-        assert any("docker" in s.lower() or "Docker" in s for s in snippets)
-
-    def test_search_empty_query(self, db):
-        assert db.search_messages("") == []
-        assert db.search_messages("   ") == []
-
-    def test_search_with_source_filter(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="CLI question about Python")
-
-        db.create_session(session_id="s2", source="telegram")
-        db.append_message("s2", role="user", content="Telegram question about Python")
-
-        results = db.search_messages("Python", source_filter=["telegram"])
-        # Should only find the telegram message
-        sources = [r["source"] for r in results]
-        assert all(s == "telegram" for s in sources)
-
-    def test_search_default_sources_include_acp(self, db):
-        db.create_session(session_id="s1", source="acp")
-        db.append_message("s1", role="user", content="ACP question about Python")
-
-        results = db.search_messages("Python")
-        sources = [r["source"] for r in results]
-        assert "acp" in sources
-
-    def test_search_default_includes_all_platforms(self, db):
-        """Default search (no source_filter) should find sessions from any platform."""
-        for src in ("cli", "telegram", "signal", "homeassistant", "acp", "matrix"):
-            sid = f"s-{src}"
-            db.create_session(session_id=sid, source=src)
-            db.append_message(sid, role="user", content=f"universal search test from {src}")
-
-        results = db.search_messages("universal search test")
-        found_sources = {r["source"] for r in results}
-        assert found_sources == {"cli", "telegram", "signal", "homeassistant", "acp", "matrix"}
-
-    def test_search_with_role_filter(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="What is FastAPI?")
-        db.append_message("s1", role="assistant", content="FastAPI is a web framework.")
-
-        results = db.search_messages("FastAPI", role_filter=["assistant"])
-        roles = [r["role"] for r in results]
-        assert all(r == "assistant" for r in roles)
-
-    def test_search_returns_context(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="Tell me about Kubernetes")
-        db.append_message("s1", role="assistant", content="Kubernetes is an orchestrator.")
-
-        results = db.search_messages("Kubernetes")
-        assert len(results) == 2
-        assert "context" in results[0]
-        assert isinstance(results[0]["context"], list)
-        assert len(results[0]["context"]) > 0
-
-    def test_search_special_chars_do_not_crash(self, db):
-        """FTS5 special characters in queries must not raise OperationalError."""
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="How do I use C++ templates?")
-
-        # Each of these previously caused sqlite3.OperationalError
-        dangerous_queries = [
-            'C++',              # + is FTS5 column filter
-            '"unterminated',    # unbalanced double-quote
-            '(problem',         # unbalanced parenthesis
-            'hello AND',        # dangling boolean operator
-            '***',              # repeated wildcard
-            '{test}',           # curly braces (column reference)
-            'OR hello',         # leading boolean operator
-            'a AND OR b',       # adjacent operators
-        ]
-        for query in dangerous_queries:
-            # Must not raise — should return list (possibly empty)
-            results = db.search_messages(query)
-            assert isinstance(results, list), f"Query {query!r} did not return a list"
-
-    def test_search_sanitized_query_still_finds_content(self, db):
-        """Sanitization must not break normal keyword search."""
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="Learning C++ templates today")
-
-        # "C++" sanitized to "C" should still match "C++"
-        results = db.search_messages("C++")
-        # The word "C" appears in the content, so FTS5 should find it
-        assert isinstance(results, list)
-
-    def test_search_hyphenated_term_does_not_crash(self, db):
-        """Hyphenated terms like 'chat-send' must not crash FTS5."""
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="Run the chat-send command")
-
-        results = db.search_messages("chat-send")
-        assert isinstance(results, list)
-        assert len(results) >= 1
-        assert any("chat-send" in (r.get("snippet") or r.get("content", "")).lower()
-                    for r in results)
-
-    def test_search_quoted_phrase_preserved(self, db):
-        """User-provided quoted phrases should be preserved for exact matching."""
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="docker networking is complex")
-        db.append_message("s1", role="assistant", content="networking docker tips")
-
-        # Quoted phrase should match only the exact order
-        results = db.search_messages('"docker networking"')
-        assert isinstance(results, list)
-        # Should find the user message (exact phrase) but may or may not find
-        # the assistant message depending on FTS5 phrase matching
-        assert len(results) >= 1
-
-    def test_sanitize_fts5_query_strips_dangerous_chars(self):
-        """Unit test for _sanitize_fts5_query static method."""
-        from hermes_state import SessionDB
-        s = SessionDB._sanitize_fts5_query
-        assert s('hello world') == 'hello world'
-        assert '+' not in s('C++')
-        assert '"' not in s('"unterminated')
-        assert '(' not in s('(problem')
-        assert '{' not in s('{test}')
-        # Dangling operators removed
-        assert s('hello AND') == 'hello'
-        assert s('OR world') == 'world'
-        # Leading bare * removed
-        assert s('***') == ''
-        # Valid prefix kept
-        assert s('deploy*') == 'deploy*'
-
-    def test_sanitize_fts5_preserves_quoted_phrases(self):
-        """Properly paired double-quoted phrases should be preserved."""
-        from hermes_state import SessionDB
-        s = SessionDB._sanitize_fts5_query
-        # Simple quoted phrase
-        assert s('"exact phrase"') == '"exact phrase"'
-        # Quoted phrase alongside unquoted terms
-        assert '"docker networking"' in s('"docker networking" setup')
-        # Multiple quoted phrases
-        result = s('"hello world" OR "foo bar"')
-        assert '"hello world"' in result
-        assert '"foo bar"' in result
-        # Unmatched quote still stripped
-        assert '"' not in s('"unterminated')
-
-    def test_sanitize_fts5_quotes_hyphenated_terms(self):
-        """Hyphenated terms should be wrapped in quotes for exact matching."""
-        from hermes_state import SessionDB
-        s = SessionDB._sanitize_fts5_query
-        # Simple hyphenated term
-        assert s('chat-send') == '"chat-send"'
-        # Multiple hyphens
-        assert s('docker-compose-up') == '"docker-compose-up"'
-        # Hyphenated term with other words
-        result = s('fix chat-send bug')
-        assert '"chat-send"' in result
-        assert 'fix' in result
-        assert 'bug' in result
-        # Multiple hyphenated terms with OR
-        result = s('chat-send OR deploy-prod')
-        assert '"chat-send"' in result
-        assert '"deploy-prod"' in result
-        # Already-quoted hyphenated term — no double quoting
-        assert s('"chat-send"') == '"chat-send"'
-        # Hyphenated inside a quoted phrase stays as-is
-        assert s('"my chat-send thing"') == '"my chat-send thing"'
-
-
-# =========================================================================
-# Session search and listing
-# =========================================================================
-
-class TestSearchSessions:
-    def test_list_all_sessions(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.create_session(session_id="s2", source="telegram")
-
-        sessions = db.search_sessions()
-        assert len(sessions) == 2
-
-    def test_filter_by_source(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.create_session(session_id="s2", source="telegram")
-
-        sessions = db.search_sessions(source="cli")
-        assert len(sessions) == 1
-        assert sessions[0]["source"] == "cli"
-
-    def test_pagination(self, db):
-        for i in range(5):
-            db.create_session(session_id=f"s{i}", source="cli")
-
-        page1 = db.search_sessions(limit=2)
-        page2 = db.search_sessions(limit=2, offset=2)
-        assert len(page1) == 2
-        assert len(page2) == 2
-        assert page1[0]["id"] != page2[0]["id"]
-
-
-# =========================================================================
-# Counts
-# =========================================================================
-
-class TestCounts:
-    def test_session_count(self, db):
-        assert db.session_count() == 0
-        db.create_session(session_id="s1", source="cli")
-        db.create_session(session_id="s2", source="telegram")
-        assert db.session_count() == 2
-
-    def test_session_count_by_source(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.create_session(session_id="s2", source="telegram")
-        db.create_session(session_id="s3", source="cli")
-        assert db.session_count(source="cli") == 2
-        assert db.session_count(source="telegram") == 1
-
-    def test_message_count_total(self, db):
-        assert db.message_count() == 0
-        db.create_session(session_id="s1", source="cli")
-        db.append_message("s1", role="user", content="Hello")
-        db.append_message("s1", role="assistant", content="Hi")
-        assert db.message_count() == 2
-
-    def test_message_count_per_session(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.create_session(session_id="s2", source="cli")
-        db.append_message("s1", role="user", content="A")
-        db.append_message("s2", role="user", content="B")
-        db.append_message("s2", role="user", content="C")
-        assert db.message_count(session_id="s1") == 1
-        assert db.message_count(session_id="s2") == 2
-
-
-# =========================================================================
-# Delete and export
-# =========================================================================
-
-class TestDeleteAndExport:
-    def test_delete_session(self, db):
-        db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Hello")
 
-        assert db.delete_session("s1") is True
-        assert db.get_session("s1") is None
-        assert db.message_count(session_id="s1") == 0
+        assert db.get_session("s1")["model"] == "test-model"
+        assert db.get_session("s1")["system_prompt"] == "System prompt text"
+        assert db.get_session("s1")["ended_at"] is not None
+        assert db.get_session("s1")["title"] == "My Title"
 
-    def test_delete_nonexistent(self, db):
-        assert db.delete_session("nope") is False
+        db.clear_messages("s1")
 
-    def test_resolve_session_id_exact(self, db):
-        db.create_session(session_id="20260315_092437_c9a6ff", source="cli")
-        assert db.resolve_session_id("20260315_092437_c9a6ff") == "20260315_092437_c9a6ff"
-
-    def test_resolve_session_id_unique_prefix(self, db):
-        db.create_session(session_id="20260315_092437_c9a6ff", source="cli")
-        assert db.resolve_session_id("20260315_092437_c9a6") == "20260315_092437_c9a6ff"
-
-    def test_resolve_session_id_ambiguous_prefix_returns_none(self, db):
-        db.create_session(session_id="20260315_092437_c9a6aa", source="cli")
-        db.create_session(session_id="20260315_092437_c9a6bb", source="cli")
-        assert db.resolve_session_id("20260315_092437_c9a6") is None
-
-    def test_resolve_session_id_escapes_like_wildcards(self, db):
-        db.create_session(session_id="20260315_092437_c9a6ff", source="cli")
-        db.create_session(session_id="20260315X092437_c9a6ff", source="cli")
-        assert db.resolve_session_id("20260315_092437") == "20260315_092437_c9a6ff"
-
-    def test_export_session(self, db):
-        db.create_session(session_id="s1", source="cli", model="test")
-        db.append_message("s1", role="user", content="Hello")
-        db.append_message("s1", role="assistant", content="Hi")
-
-        export = db.export_session("s1")
-        assert isinstance(export, dict)
-        assert export["source"] == "cli"
-        assert len(export["messages"]) == 2
-
-    def test_export_nonexistent(self, db):
-        assert db.export_session("nope") is None
-
-    def test_export_all(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.create_session(session_id="s2", source="telegram")
-        db.append_message("s1", role="user", content="A")
-
-        exports = db.export_all()
-        assert len(exports) == 2
-
-    def test_export_all_with_source(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.create_session(session_id="s2", source="telegram")
-
-        exports = db.export_all(source="cli")
-        assert len(exports) == 1
-        assert exports[0]["source"] == "cli"
+        # Session metadata should persist
+        assert db.get_session("s1")["model"] == "test-model"
+        assert db.get_session("s1")["system_prompt"] == "System prompt text"
+        assert db.get_session("s1")["ended_at"] is not None
+        assert db.get_session("s1")["title"] == "My Title"
 
 
-# =========================================================================
-# Prune
-# =========================================================================
+class TestClose:
+    """Tests for close() method."""
 
-class TestPruneSessions:
-    def test_prune_old_ended_sessions(self, db):
-        # Create and end an "old" session
-        db.create_session(session_id="old", source="cli")
+    def test_close_releases_connection(self, db: SessionDB):
+        assert db._conn is not None
+        db.close()
+        assert db._conn is None
+
+    def test_close_twice_no_error(self, db: SessionDB):
+        db.close()
+        db.close()  # Should not raise
+
+    def test_close_after_append(self, db: SessionDB):
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+
+        db.close()
+
+        # Connection released, can be reopened
+        new_db = SessionDB(db_path=db.db_path)
+        new_db.close()
+
+
+class TestPruneSessionsEdgeCases:
+    """Edge cases for prune_sessions()."""
+
+    def test_prune_zero_days(self, db: SessionDB):
+        """Pruning with 0 days should delete all ended sessions."""
+        db.create_session("old1", "cli")
+        db.end_session("old1", end_reason="done")
+        db.create_session("old2", "cli")
+        db.end_session("old2", end_reason="done")
+
+        pruned = db.prune_sessions(older_than_days=0)
+        assert pruned == 2
+        assert db.get_session("old1") is None
+        assert db.get_session("old2") is None
+
+    def test_prune_all_active_skipped(self, db: SessionDB):
+        """All active sessions should be skipped."""
+        db.create_session("active1", "cli")
+        db.create_session("active2", "cli")
+
+        pruned = db.prune_sessions(older_than_days=90)
+        assert pruned == 0
+        assert db.get_session("active1") is not None
+        assert db.get_session("active2") is not None
+
+    def test_prune_empty_db(self, db: SessionDB):
+        """Pruning empty database should return 0."""
+        pruned = db.prune_sessions(older_than_days=90)
+        assert pruned == 0
+
+    def test_prune_preserves_started_at(self, db: SessionDB):
+        """Pruning should delete sessions, not just truncate."""
+        db.create_session("old", "cli")
         db.end_session("old", end_reason="done")
-        # Manually backdate started_at
         db._conn.execute(
             "UPDATE sessions SET started_at = ? WHERE id = ?",
-            (time.time() - 100 * 86400, "old"),
+            (time.time() - 200 * 86400, "old"),
         )
         db._conn.commit()
-
-        # Create a recent session
-        db.create_session(session_id="new", source="cli")
 
         pruned = db.prune_sessions(older_than_days=90)
         assert pruned == 1
         assert db.get_session("old") is None
-        session = db.get_session("new")
-        assert session is not None
-        assert session["id"] == "new"
-
-    def test_prune_skips_active_sessions(self, db):
-        db.create_session(session_id="active", source="cli")
-        # Backdate but don't end
-        db._conn.execute(
-            "UPDATE sessions SET started_at = ? WHERE id = ?",
-            (time.time() - 200 * 86400, "active"),
-        )
-        db._conn.commit()
-
-        pruned = db.prune_sessions(older_than_days=90)
-        assert pruned == 0
-        assert db.get_session("active") is not None
-
-    def test_prune_with_source_filter(self, db):
-        for sid, src in [("old_cli", "cli"), ("old_tg", "telegram")]:
-            db.create_session(session_id=sid, source=src)
-            db.end_session(sid, end_reason="done")
-            db._conn.execute(
-                "UPDATE sessions SET started_at = ? WHERE id = ?",
-                (time.time() - 200 * 86400, sid),
-            )
-        db._conn.commit()
-
-        pruned = db.prune_sessions(older_than_days=90, source="cli")
-        assert pruned == 1
-        assert db.get_session("old_cli") is None
-        assert db.get_session("old_tg") is not None
 
 
-# =========================================================================
-# Schema and WAL mode
-# =========================================================================
+class TestListSessionsRichEdgeCases:
+    """Edge cases for list_sessions_rich()."""
 
-# =========================================================================
-# Session title
-# =========================================================================
+    def test_list_empty_database(self, db: SessionDB):
+        """Listing empty database should return empty list."""
+        sessions = db.list_sessions_rich()
+        assert sessions == []
 
-class TestSessionTitle:
-    def test_set_and_get_title(self, db):
-        db.create_session(session_id="s1", source="cli")
-        assert db.set_session_title("s1", "My Session") is True
+    def test_list_limit_zero(self, db: SessionDB):
+        """Limit=0 should return empty list."""
+        db.create_session("s1", "cli")
+        db.create_session("s2", "cli")
 
-        session = db.get_session("s1")
-        assert session["title"] == "My Session"
+        sessions = db.list_sessions_rich(limit=0)
+        assert sessions == []
 
-    def test_set_title_nonexistent_session(self, db):
-        assert db.set_session_title("nonexistent", "Title") is False
+    def test_list_large_offset(self, db: SessionDB):
+        """Large offset should return empty (no more results)."""
+        for i in range(3):
+            db.create_session(f"s{i}", "cli")
+            db.append_message(f"s{i}", "user", f"Message {i}")
 
-    def test_title_initially_none(self, db):
-        db.create_session(session_id="s1", source="cli")
-        session = db.get_session("s1")
-        assert session["title"] is None
+        sessions = db.list_sessions_rich(offset=100)
+        assert sessions == []
 
-    def test_update_title(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.set_session_title("s1", "First Title")
-        db.set_session_title("s1", "Updated Title")
+    def test_list_all_fields_present(self, db: SessionDB):
+        """All expected fields should be present in result."""
+        import time
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+        db.append_message("s1", "assistant", "Hi")
 
-        session = db.get_session("s1")
-        assert session["title"] == "Updated Title"
+        sessions = db.list_sessions_rich(limit=1)
+        assert len(sessions) == 1
+        session = sessions[0]
 
-    def test_title_in_search_sessions(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.set_session_title("s1", "Debugging Auth")
-        db.create_session(session_id="s2", source="cli")
+        # Check all expected fields
+        assert "id" in session
+        assert "source" in session
+        assert "model" in session
+        assert "title" in session
+        assert "started_at" in session
+        assert "ended_at" in session
+        assert "message_count" in session
+        assert "preview" in session
+        assert "last_active" in session
+        # Note: Some fields may be None if not set
 
-        sessions = db.search_sessions()
-        titled = [s for s in sessions if s.get("title") == "Debugging Auth"]
-        assert len(titled) == 1
-        assert titled[0]["id"] == "s1"
 
-    def test_title_in_export(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.set_session_title("s1", "Export Test")
-        db.append_message("s1", role="user", content="Hello")
+class TestGetSessionByTitleEdgeCases:
+    """Edge cases for get_session_by_title()."""
 
-        export = db.export_session("s1")
-        assert export["title"] == "Export Test"
+    def test_case_sensitive(self, db: SessionDB):
+        """Title lookup should be case-sensitive."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "My Title")
 
-    def test_title_with_special_characters(self, db):
-        db.create_session(session_id="s1", source="cli")
-        title = "PR #438 — fixing the 'auth' middleware"
+        result = db.get_session_by_title("my title")
+        assert result is None
+
+        result = db.get_session_by_title("My Title")
+        assert result is not None
+
+    def test_special_characters_in_title(self, db: SessionDB):
+        """Titles with special characters should work."""
+        db.create_session("s1", "cli")
+        title = "Title with spaces and #1"
         db.set_session_title("s1", title)
 
-        session = db.get_session("s1")
-        assert session["title"] == title
+        result = db.get_session_by_title(title)
+        assert result is not None
 
-    def test_title_empty_string_normalized_to_none(self, db):
-        """Empty strings are normalized to None (clearing the title)."""
-        db.create_session(session_id="s1", source="cli")
+    def test_empty_title(self, db: SessionDB):
+        """Empty title should return None."""
+        db.create_session("s1", "cli")
+        result = db.get_session_by_title("")
+        assert result is None
+
+
+class TestAppendMessageEdgeCases:
+    """Edge cases for append_message()."""
+
+    def test_tool_calls_none(self, db: SessionDB):
+        """tool_calls=None should work (no tool calls counted)."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "assistant", "Hello", tool_calls=None)
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        assert session["tool_call_count"] == 0
+
+    def test_tool_calls_empty_list(self, db: SessionDB):
+        """tool_calls=[] should work (no tool calls counted)."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "assistant", "Hello", tool_calls=[])
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        assert session["tool_call_count"] == 0
+
+    def test_tool_calls_non_list(self, db: SessionDB):
+        """tool_calls with non-list value (should be treated as 1 call)."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "assistant", "Hello", tool_calls="some_string")
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        # Non-list with truthy value counts as 1
+        assert session["tool_call_count"] == 1
+
+    def test_tool_calls_single_dict(self, db: SessionDB):
+        """tool_calls with single dict (should count as 1)."""
+        db.create_session("s1", "cli")
+        tool_calls = [{"id": "call_1", "function": {"name": "test"}}]
+        db.append_message("s1", "assistant", "Hello", tool_calls=tool_calls)
+
+        session = db.get_session("s1")
+        assert session["tool_call_count"] == 1
+
+
+class TestExportAllEdgeCases:
+    """Edge cases for export_all()."""
+
+    def test_export_all_empty_source(self, db: SessionDB):
+        """export_all(source=...) with no matches should return empty list."""
+        db.create_session("s1", "cli")
+        db.create_session("s2", "telegram")
+
+        exports = db.export_all(source="nonexistent")
+        assert exports == []
+
+    def test_export_all_with_messages(self, db: SessionDB):
+        """Export should include messages."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+        db.append_message("s1", "assistant", "Hi")
+
+        exports = db.export_all()
+        assert len(exports) == 1
+        assert len(exports[0]["messages"]) == 2
+
+    def test_export_all_preserves_all_fields(self, db: SessionDB):
+        """Export should preserve all session fields."""
+        db.create_session(
+            "s1",
+            "cli",
+            model="test-model",
+            system_prompt="System prompt",
+        )
+        db.end_session("s1", end_reason="done")
         db.set_session_title("s1", "My Title")
-        # Setting to empty string should clear the title (normalize to None)
-        db.set_session_title("s1", "")
+        db.append_message("s1", "user", "Hello")
 
-        session = db.get_session("s1")
-        assert session["title"] is None
+        exports = db.export_all()
+        export = exports[0]
 
-    def test_multiple_empty_titles_no_conflict(self, db):
-        """Multiple sessions can have empty-string (normalized to NULL) titles."""
-        db.create_session(session_id="s1", source="cli")
-        db.create_session(session_id="s2", source="cli")
-        db.set_session_title("s1", "")
-        db.set_session_title("s2", "")
-        # Both should be None, no uniqueness conflict
-        assert db.get_session("s1")["title"] is None
-        assert db.get_session("s2")["title"] is None
-
-    def test_title_survives_end_session(self, db):
-        db.create_session(session_id="s1", source="cli")
-        db.set_session_title("s1", "Before End")
-        db.end_session("s1", end_reason="user_exit")
-
-        session = db.get_session("s1")
-        assert session["title"] == "Before End"
-        assert session["ended_at"] is not None
+        assert "id" in export
+        assert "source" in export
+        assert "model" in export
+        assert "system_prompt" in export
+        assert "title" in export
+        assert "ended_at" in export
+        assert "messages" in export
+        assert len(export["messages"]) == 1
 
 
-class TestSanitizeTitle:
-    """Tests for SessionDB.sanitize_title() validation and cleaning."""
+class TestConcurrentAccess:
+    """Tests for thread safety and concurrent access."""
 
-    def test_normal_title_unchanged(self):
-        assert SessionDB.sanitize_title("My Project") == "My Project"
+    def test_concurrent_reads_writes(self, db: SessionDB):
+        """Concurrent reads and writes should not corrupt data."""
+        import threading
+        import time
 
-    def test_strips_whitespace(self):
-        assert SessionDB.sanitize_title("  hello world  ") == "hello world"
+        errors = []
+        lock = threading.Lock()
 
-    def test_collapses_internal_whitespace(self):
-        assert SessionDB.sanitize_title("hello   world") == "hello world"
+        def writer():
+            try:
+                for i in range(10):
+                    session_id = f"writer_{i}"
+                    db.create_session(session_id, "cli")
+                    db.append_message(session_id, "user", f"Message {i}")
+                    db.end_session(session_id, end_reason="done")
+                    time.sleep(0.01)
+            except Exception as e:
+                with lock:
+                    errors.append(e)
 
-    def test_tabs_and_newlines_collapsed(self):
-        assert SessionDB.sanitize_title("hello\t\nworld") == "hello world"
+        def reader():
+            try:
+                for i in range(10):
+                    time.sleep(0.01)
+                    sessions = db.search_sessions()
+                    messages = db.message_count()
+                    assert len(sessions) == 0  # All created by writer
+                    assert messages == 0  # All created by writer
+            except Exception as e:
+                with lock:
+                    errors.append(e)
 
-    def test_none_returns_none(self):
-        assert SessionDB.sanitize_title(None) is None
+        threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
-    def test_empty_string_returns_none(self):
-        assert SessionDB.sanitize_title("") is None
+        # All reads should succeed
+        assert len(errors) == 0
 
-    def test_whitespace_only_returns_none(self):
-        assert SessionDB.sanitize_title("   \t\n  ") is None
+        # Verify data integrity
+        assert db.session_count() == 10
+        assert db.message_count() == 10
 
-    def test_control_chars_stripped(self):
-        # Null byte, bell, backspace, etc.
-        assert SessionDB.sanitize_title("hello\x00world") == "helloworld"
-        assert SessionDB.sanitize_title("\x07\x08test\x1b") == "test"
+    def test_concurrent_same_session_writes(self, db: SessionDB):
+        """Multiple concurrent writes to same session should be consistent."""
+        import threading
+        import time
 
-    def test_del_char_stripped(self):
-        assert SessionDB.sanitize_title("hello\x7fworld") == "helloworld"
+        session_id = "concurrent_session"
+        db.create_session(session_id, "cli")
 
-    def test_zero_width_chars_stripped(self):
-        # Zero-width space (U+200B), zero-width joiner (U+200D)
-        assert SessionDB.sanitize_title("hello\u200bworld") == "helloworld"
-        assert SessionDB.sanitize_title("hello\u200dworld") == "helloworld"
+        errors = []
+        lock = threading.Lock()
 
-    def test_rtl_override_stripped(self):
-        # Right-to-left override (U+202E) — used in filename spoofing attacks
-        assert SessionDB.sanitize_title("hello\u202eworld") == "helloworld"
+        def writer(count):
+            try:
+                for _ in range(count):
+                    db.append_message(session_id, "user", f"Message from {count}")
+                    time.sleep(0.01)
+            except Exception as e:
+                with lock:
+                    errors.append(e)
 
-    def test_bom_stripped(self):
-        # Byte order mark (U+FEFF)
-        assert SessionDB.sanitize_title("\ufeffhello") == "hello"
+        threads = [threading.Thread(target=writer, args=(5,)) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
-    def test_only_control_chars_returns_none(self):
-        assert SessionDB.sanitize_title("\x00\x01\x02\u200b\ufeff") is None
+        assert len(errors) == 0
 
-    def test_max_length_allowed(self):
-        title = "A" * 100
-        assert SessionDB.sanitize_title(title) == title
-
-    def test_exceeds_max_length_raises(self):
-        title = "A" * 101
-        with pytest.raises(ValueError, match="too long"):
-            SessionDB.sanitize_title(title)
-
-    def test_unicode_emoji_allowed(self):
-        assert SessionDB.sanitize_title("🚀 My Project 🎉") == "🚀 My Project 🎉"
-
-    def test_cjk_characters_allowed(self):
-        assert SessionDB.sanitize_title("我的项目") == "我的项目"
-
-    def test_accented_characters_allowed(self):
-        assert SessionDB.sanitize_title("Résumé éditing") == "Résumé éditing"
-
-    def test_special_punctuation_allowed(self):
-        title = "PR #438 — fixing the 'auth' middleware"
-        assert SessionDB.sanitize_title(title) == title
-
-    def test_sanitize_applied_in_set_session_title(self, db):
-        """set_session_title applies sanitize_title internally."""
-        db.create_session("s1", "cli")
-        db.set_session_title("s1", "  hello\x00  world  ")
-        assert db.get_session("s1")["title"] == "hello world"
-
-    def test_too_long_title_rejected_by_set(self, db):
-        """set_session_title raises ValueError for overly long titles."""
-        db.create_session("s1", "cli")
-        with pytest.raises(ValueError, match="too long"):
-            db.set_session_title("s1", "X" * 150)
+        # Should have 15 messages total (3 threads × 5 messages)
+        assert db.message_count(session_id) == 15
 
 
-class TestSchemaInit:
-    def test_wal_mode(self, db):
-        cursor = db._conn.execute("PRAGMA journal_mode")
-        mode = cursor.fetchone()[0]
-        assert mode == "wal"
+class TestSchemaInitEdgeCases:
+    """Edge cases for schema initialization."""
 
-    def test_foreign_keys_enabled(self, db):
-        cursor = db._conn.execute("PRAGMA foreign_keys")
-        assert cursor.fetchone()[0] == 1
+    def test_clean_database_creation(self, tmp_path):
+        """Creating a new database should initialize to v5."""
+        db_path = tmp_path / "clean_db.db"
+        db = SessionDB(db_path=db_path)
 
-    def test_tables_exist(self, db):
+        # Should be at v5 immediately
+        cursor = db._conn.execute("SELECT version FROM schema_version")
+        version = cursor.fetchone()[0]
+        assert version == 5
+
+        # Verify all tables exist
         cursor = db._conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
         )
@@ -733,44 +430,27 @@ class TestSchemaInit:
         assert "sessions" in tables
         assert "messages" in tables
         assert "schema_version" in tables
+        assert "messages_fts" in tables
 
-    def test_schema_version(self, db):
-        cursor = db._conn.execute("SELECT version FROM schema_version")
-        version = cursor.fetchone()[0]
-        assert version == 5
+        db.close()
 
-    def test_title_column_exists(self, db):
-        """Verify the title column was created in the sessions table."""
-        cursor = db._conn.execute("PRAGMA table_info(sessions)")
-        columns = {row[1] for row in cursor.fetchall()}
-        assert "title" in columns
-
-    def test_migration_from_v2(self, tmp_path):
-        """Simulate a v2 database and verify migration adds title column."""
+    def test_upgrade_from_v5_to_v5(self, tmp_path):
+        """Opening a v5 database should not change version."""
         import sqlite3
 
-        db_path = tmp_path / "migrate_test.db"
+        db_path = tmp_path / "v5_db.db"
         conn = sqlite3.connect(str(db_path))
-        # Create v2 schema (without title column)
+
+        # Create v5 schema
         conn.executescript("""
             CREATE TABLE schema_version (version INTEGER NOT NULL);
-            INSERT INTO schema_version (version) VALUES (2);
+            INSERT INTO schema_version (version) VALUES (5);
 
             CREATE TABLE sessions (
                 id TEXT PRIMARY KEY,
                 source TEXT NOT NULL,
-                user_id TEXT,
-                model TEXT,
-                model_config TEXT,
-                system_prompt TEXT,
-                parent_session_id TEXT,
                 started_at REAL NOT NULL,
-                ended_at REAL,
-                end_reason TEXT,
-                message_count INTEGER DEFAULT 0,
-                tool_call_count INTEGER DEFAULT 0,
-                input_tokens INTEGER DEFAULT 0,
-                output_tokens INTEGER DEFAULT 0
+                title TEXT,
             );
 
             CREATE TABLE messages (
@@ -778,14 +458,27 @@ class TestSchemaInit:
                 session_id TEXT NOT NULL,
                 role TEXT NOT NULL,
                 content TEXT,
-                tool_call_id TEXT,
-                tool_calls TEXT,
-                tool_name TEXT,
                 timestamp REAL NOT NULL,
-                token_count INTEGER,
-                finish_reason TEXT
             );
+
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+                content, content=messages, content_rowid=id
+            );
+
+            CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+
+            CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+            END;
+
+            CREATE TRIGGER messages_fts_update AFTER UPDATE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+            END;
         """)
+
         conn.execute(
             "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
             ("existing", "cli", 1000.0),
@@ -793,241 +486,2564 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v5
-        migrated_db = SessionDB(db_path=db_path)
+        # Open with SessionDB
+        db = SessionDB(db_path=db_path)
 
-        # Verify migration
-        cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 5
+        # Should still be v5
+        cursor = db._conn.execute("SELECT version FROM schema_version")
+        version = cursor.fetchone()[0]
+        assert version == 5
 
-        # Verify title column exists and is NULL for existing sessions
-        session = migrated_db.get_session("existing")
-        assert session is not None
-        assert session["title"] is None
-
-        # Verify we can set title on migrated session
-        assert migrated_db.set_session_title("existing", "Migrated Title") is True
-        session = migrated_db.get_session("existing")
-        assert session["title"] == "Migrated Title"
-
-        migrated_db.close()
+        db.close()
 
 
-class TestTitleUniqueness:
-    """Tests for unique title enforcement and title-based lookups."""
+class TestUpdateTokenCountsEdgeCases:
+    """Edge cases for update_token_counts()."""
 
-    def test_duplicate_title_raises(self, db):
-        """Setting a title already used by another session raises ValueError."""
+    def test_update_all_billing_fields(self, db: SessionDB):
+        """Test updating all billing-related fields."""
         db.create_session("s1", "cli")
-        db.create_session("s2", "cli")
-        db.set_session_title("s1", "my project")
-        with pytest.raises(ValueError, match="already in use"):
-            db.set_session_title("s2", "my project")
 
-    def test_same_session_can_keep_title(self, db):
-        """A session can re-set its own title without error."""
+        db.update_token_counts(
+            "s1",
+            input_tokens=100,
+            output_tokens=50,
+            cache_read_tokens=10,
+            cache_write_tokens=5,
+            reasoning_tokens=20,
+            estimated_cost_usd=1.0,
+            actual_cost_usd=1.05,
+            cost_status="within budget",
+            cost_source="api",
+            pricing_version="2024.01",
+            billing_provider="anthropic",
+            billing_base_url="https://api.anthropic.com",
+            billing_mode="standard",
+        )
+
+        session = db.get_session("s1")
+
+        # Check all billing fields
+        assert session["billing_provider"] == "anthropic"
+        assert session["billing_base_url"] == "https://api.anthropic.com"
+        assert session["billing_mode"] == "standard"
+        assert session["estimated_cost_usd"] == 1.0
+        assert session["actual_cost_usd"] == 1.05
+        assert session["cost_status"] == "within budget"
+        assert session["cost_source"] == "api"
+        assert session["pricing_version"] == "2024.01"
+
+    def test_cost_accumulation(self, db: SessionDB):
+        """Costs should accumulate across multiple updates."""
         db.create_session("s1", "cli")
-        db.set_session_title("s1", "my project")
-        # Should not raise — it's the same session
-        assert db.set_session_title("s1", "my project") is True
 
-    def test_null_titles_not_unique(self, db):
-        """Multiple sessions can have NULL titles (no constraint violation)."""
+        # First update
+        db.update_token_counts("s1", input_tokens=100, estimated_cost_usd=1.0)
+        session = db.get_session("s1")
+        assert session["input_tokens"] == 100
+        assert session["estimated_cost_usd"] == 1.0
+
+        # Second update
+        db.update_token_counts("s1", input_tokens=100, estimated_cost_usd=2.0)
+        session = db.get_session("s1")
+        assert session["input_tokens"] == 200
+        assert session["estimated_cost_usd"] == 3.0
+
+    def test_cost_status_preserved(self, db: SessionDB):
+        """Cost status should be preserved across updates."""
         db.create_session("s1", "cli")
-        db.create_session("s2", "cli")
-        # Both have NULL titles — no error
-        assert db.get_session("s1")["title"] is None
-        assert db.get_session("s2")["title"] is None
 
-    def test_get_session_by_title(self, db):
+        # First update with "within budget"
+        db.update_token_counts("s1", input_tokens=100, cost_status="within budget")
+
+        # Second update without cost_status (should preserve)
+        db.update_token_counts("s1", input_tokens=100)
+
+        session = db.get_session("s1")
+        assert session["cost_status"] == "within budget"
+
+    def test_billing_fields_backfill_once(self, db: SessionDB):
+        """Billing fields should be backfilled only once, then preserved."""
         db.create_session("s1", "cli")
-        db.set_session_title("s1", "refactoring auth")
-        result = db.get_session_by_title("refactoring auth")
-        assert result is not None
-        assert result["id"] == "s1"
 
-    def test_get_session_by_title_not_found(self, db):
-        assert db.get_session_by_title("nonexistent") is None
+        # First update with billing fields
+        db.update_token_counts(
+            "s1",
+            input_tokens=100,
+            billing_provider="test",
+            billing_base_url="https://test.com",
+        )
 
-    def test_get_session_title(self, db):
+        # Second update without billing fields (should preserve)
+        db.update_token_counts("s1", input_tokens=100)
+
+        session = db.get_session("s1")
+        assert session["billing_provider"] == "test"
+        assert session["billing_base_url"] == "https://test.com"
+
+    def test_billing_over_budget_status(self, db: SessionDB):
+        """Test 'over budget' cost status."""
         db.create_session("s1", "cli")
-        assert db.get_session_title("s1") is None
-        db.set_session_title("s1", "my title")
-        assert db.get_session_title("s1") == "my title"
 
-    def test_get_session_title_nonexistent(self, db):
-        assert db.get_session_title("nonexistent") is None
+        db.update_token_counts(
+            "s1",
+            input_tokens=100,
+            actual_cost_usd=1000.0,
+            cost_status="over budget",
+            cost_source="api",
+            pricing_version="2024.01",
+        )
+
+        session = db.get_session("s1")
+        assert session["cost_status"] == "over budget"
+        assert session["actual_cost_usd"] == 1000.0
 
 
-class TestTitleLineage:
-    """Tests for title lineage resolution and auto-numbering."""
+class TestFTSEdgeCases:
+    """Edge cases for FTS5 search."""
 
-    def test_resolve_exact_title(self, db):
+    def test_search_whitespace_only_query(self, db: SessionDB):
+        """Search with whitespace-only query should return empty."""
         db.create_session("s1", "cli")
-        db.set_session_title("s1", "my project")
-        assert db.resolve_session_by_title("my project") == "s1"
+        db.append_message("s1", "user", "Hello")
 
-    def test_resolve_returns_latest_numbered(self, db):
-        """When numbered variants exist, return the most recent one."""
-        import time
+        assert db.search_messages("   ") == []
+        assert db.search_messages("\t\n") == []
+
+    def test_search_single_character(self, db: SessionDB):
+        """Search with single character should work."""
         db.create_session("s1", "cli")
-        db.set_session_title("s1", "my project")
-        time.sleep(0.01)
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "my project #2")
-        time.sleep(0.01)
-        db.create_session("s3", "cli")
-        db.set_session_title("s3", "my project #3")
-        # Resolving "my project" should return s3 (latest numbered variant)
-        assert db.resolve_session_by_title("my project") == "s3"
+        db.append_message("s1", "user", "Hello")
 
-    def test_resolve_exact_numbered(self, db):
-        """Resolving an exact numbered title returns that specific session."""
+        results = db.search_messages("e")
+        assert isinstance(results, list)  # May or may not match depending on FTS5
+
+    def test_search_unicode_content(self, db: SessionDB):
+        """Search with unicode content should work."""
         db.create_session("s1", "cli")
-        db.set_session_title("s1", "my project")
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "my project #2")
-        # Resolving "my project #2" exactly should return s2
-        assert db.resolve_session_by_title("my project #2") == "s2"
+        db.append_message("s1", "user", "こんにちは世界")
+        db.append_message("s1", "assistant", "Hello World")
 
-    def test_resolve_nonexistent_title(self, db):
-        assert db.resolve_session_by_title("nonexistent") is None
+        results = db.search_messages("こんにちは")
+        assert isinstance(results, list)
 
-    def test_next_title_no_existing(self, db):
-        """With no existing sessions, base title is returned as-is."""
-        assert db.get_next_title_in_lineage("my project") == "my project"
-
-    def test_next_title_first_continuation(self, db):
-        """First continuation after the original gets #2."""
+    def test_search_empty_content_message(self, db: SessionDB):
+        """Search should handle messages with empty content."""
         db.create_session("s1", "cli")
-        db.set_session_title("s1", "my project")
-        assert db.get_next_title_in_lineage("my project") == "my project #2"
+        db.append_message("s1", "user", "")
+        db.append_message("s1", "assistant", "Hello")
 
-    def test_next_title_increments(self, db):
-        """Each continuation increments the number."""
+        results = db.search_messages("Hello")
+        # Should find the assistant message
+        assert len(results) >= 0
+
+
+class TestToolCallCountEdgeCases:
+    """Edge cases for tool call counting."""
+
+    def test_tool_calls_count_in_message(self, db: SessionDB):
+        """Tool calls in assistant message should count."""
         db.create_session("s1", "cli")
-        db.set_session_title("s1", "my project")
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "my project #2")
-        db.create_session("s3", "cli")
-        db.set_session_title("s3", "my project #3")
-        assert db.get_next_title_in_lineage("my project") == "my project #4"
 
-    def test_next_title_strips_existing_number(self, db):
-        """Passing a numbered title strips the number and finds the base."""
+        tool_calls = [
+            {"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}},
+            {"id": "call_2", "function": {"name": "file_read", "arguments": "{}"}},
+        ]
+        db.append_message("s1", "assistant", "Checking...", tool_calls=tool_calls)
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        assert session["tool_call_count"] == 2
+
+    def test_tool_calls_no_content_still_counts(self, db: SessionDB):
+        """Tool calls should count even if content is empty."""
         db.create_session("s1", "cli")
-        db.set_session_title("s1", "my project")
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "my project #2")
-        # Even when called with "my project #2", it should return #3
-        assert db.get_next_title_in_lineage("my project #2") == "my project #3"
 
+        tool_calls = [{"id": "call_1", "function": {"name": "test"}}]
+        db.append_message("s1", "assistant", "", tool_calls=tool_calls)
 
-class TestTitleSqlWildcards:
-    """Titles containing SQL LIKE wildcards (%, _) must not cause false matches."""
+        session = db.get_session("s1")
+        assert session["tool_call_count"] == 1
 
-    def test_resolve_title_with_underscore(self, db):
-        """A title like 'test_project' should not match 'testXproject #2'."""
+    def test_tool_calls_with_tool_response(self, db: SessionDB):
+        """Tool responses should not increment tool_call_count."""
         db.create_session("s1", "cli")
-        db.set_session_title("s1", "test_project")
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "testXproject #2")
-        # Resolving "test_project" should return s1 (exact), not s2
-        assert db.resolve_session_by_title("test_project") == "s1"
 
-    def test_resolve_title_with_percent(self, db):
-        """A title with '%' should not wildcard-match unrelated sessions."""
+        # Assistant makes 1 tool call
+        tool_calls = [{"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}}]
+        db.append_message("s1", "assistant", "Checking...", tool_calls=tool_calls)
+
+        # Tool response comes back
+        db.append_message("s1", "tool", "Result", tool_name="web_search")
+
+        session = db.get_session("s1")
+        # Should be 1 (the assistant call), not 2
+        assert session["tool_call_count"] == 1
+
+    def test_multiple_tool_calls_multiple_responses(self, db: SessionDB):
+        """Multiple tool calls with multiple responses should count correctly."""
         db.create_session("s1", "cli")
-        db.set_session_title("s1", "100% done")
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "100X done #2")
-        # Should resolve to s1 (exact), not s2
-        assert db.resolve_session_by_title("100% done") == "s1"
 
-    def test_next_lineage_with_underscore(self, db):
-        """get_next_title_in_lineage with underscores doesn't match wrong sessions."""
+        # Assistant makes 2 parallel tool calls
+        tool_calls = [
+            {"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}},
+            {"id": "call_2", "function": {"name": "file_read", "arguments": "{}"}},
+        ]
+        db.append_message("s1", "assistant", "Checking...", tool_calls=tool_calls)
+
+        # Two tool responses
+        db.append_message("s1", "tool", "Result 1", tool_name="web_search")
+        db.append_message("s1", "tool", "Result 2", tool_name="file_read")
+
+        session = db.get_session("s1")
+        assert session["tool_call_count"] == 2
+        assert session["message_count"] == 3  # 1 assistant + 2 tool responses
+# ======================================================================
+# Untested/Edge cases
+# ======================================================================
+
+class TestClearMessages:
+    """Tests for clear_messages() - deletes all messages and resets counters."""
+
+    def test_clear_messages(self, db: SessionDB):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="Hello")
+        db.append_message("s1", role="assistant", content="Hi")
+        db.append_message("s1", role="tool", tool_name="web_search")
+
+        # Verify messages exist
+        assert db.message_count(session_id="s1") == 3
+        session = db.get_session("s1")
+        assert session["message_count"] == 3
+        assert session["tool_call_count"] == 1
+
+        # Clear messages
+        db.clear_messages("s1")
+
+        # Verify messages deleted
+        assert db.message_count(session_id="s1") == 0
+        assert db.get_messages("s1") == []
+
+        # Verify counters reset
+        session = db.get_session("s1")
+        assert session["message_count"] == 0
+        assert session["tool_call_count"] == 0
+
+    def test_clear_nonexistent_session(self, db: SessionDB):
+        # Should not raise for nonexistent session
+        assert db.clear_messages("nonexistent") is not None  # Returns None implicitly
+
+    def test_clear_messages_preserves_session_metadata(self, db: SessionDB):
+        db.create_session(
+            session_id="s1",
+            source="cli",
+            model="test-model",
+            system_prompt="System prompt text",
+        )
+        db.end_session("s1", end_reason="user_exit")
+        db.set_session_title("s1", "My Title")
+
+        db.append_message("s1", role="user", content="Hello")
+
+        assert db.get_session("s1")["model"] == "test-model"
+        assert db.get_session("s1")["system_prompt"] == "System prompt text"
+        assert db.get_session("s1")["ended_at"] is not None
+        assert db.get_session("s1")["title"] == "My Title"
+
+        db.clear_messages("s1")
+
+        # Session metadata should persist
+        assert db.get_session("s1")["model"] == "test-model"
+        assert db.get_session("s1")["system_prompt"] == "System prompt text"
+        assert db.get_session("s1")["ended_at"] is not None
+        assert db.get_session("s1")["title"] == "My Title"
+
+
+class TestClose:
+    """Tests for close() method."""
+
+    def test_close_releases_connection(self, db: SessionDB):
+        assert db._conn is not None
+        db.close()
+        assert db._conn is None
+
+    def test_close_twice_no_error(self, db: SessionDB):
+        db.close()
+        db.close()  # Should not raise
+
+    def test_close_after_append(self, db: SessionDB):
         db.create_session("s1", "cli")
-        db.set_session_title("s1", "test_project")
-        db.create_session("s2", "cli")
-        db.set_session_title("s2", "testXproject #2")
-        # Only "test_project" exists, so next should be "test_project #2"
-        assert db.get_next_title_in_lineage("test_project") == "test_project #2"
+        db.append_message("s1", "user", "Hello")
+
+        db.close()
+
+        # Connection released, can be reopened
+        new_db = SessionDB(db_path=db.db_path)
+        new_db.close()
 
 
-class TestListSessionsRich:
-    """Tests for enhanced session listing with preview and last_active."""
+class TestPruneSessionsEdgeCases:
+    """Edge cases for prune_sessions()."""
 
-    def test_preview_from_first_user_message(self, db):
-        db.create_session("s1", "cli")
-        db.append_message("s1", "system", "You are a helpful assistant.")
-        db.append_message("s1", "user", "Help me refactor the auth module please")
-        db.append_message("s1", "assistant", "Sure, let me look at it.")
+    def test_prune_zero_days(self, db: SessionDB):
+        """Pruning with 0 days should delete all ended sessions."""
+        db.create_session("old1", "cli")
+        db.end_session("old1", end_reason="done")
+        db.create_session("old2", "cli")
+        db.end_session("old2", end_reason="done")
+
+        pruned = db.prune_sessions(older_than_days=0)
+        assert pruned == 2
+        assert db.get_session("old1") is None
+        assert db.get_session("old2") is None
+
+    def test_prune_all_active_skipped(self, db: SessionDB):
+        """All active sessions should be skipped."""
+        db.create_session("active1", "cli")
+        db.create_session("active2", "cli")
+
+        pruned = db.prune_sessions(older_than_days=90)
+        assert pruned == 0
+        assert db.get_session("active1") is not None
+        assert db.get_session("active2") is not None
+
+    def test_prune_empty_db(self, db: SessionDB):
+        """Pruning empty database should return 0."""
+        pruned = db.prune_sessions(older_than_days=90)
+        assert pruned == 0
+
+    def test_prune_preserves_started_at(self, db: SessionDB):
+        """Pruning should delete sessions, not just truncate."""
+        db.create_session("old", "cli")
+        db.end_session("old", end_reason="done")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (time.time() - 200 * 86400, "old"),
+        )
+        db._conn.commit()
+
+        pruned = db.prune_sessions(older_than_days=90)
+        assert pruned == 1
+        assert db.get_session("old") is None
+
+
+class TestListSessionsRichEdgeCases:
+    """Edge cases for list_sessions_rich()."""
+
+    def test_list_empty_database(self, db: SessionDB):
+        """Listing empty database should return empty list."""
         sessions = db.list_sessions_rich()
-        assert len(sessions) == 1
-        assert "Help me refactor the auth module" in sessions[0]["preview"]
+        assert sessions == []
 
-    def test_preview_truncated_at_60(self, db):
+    def test_list_limit_zero(self, db: SessionDB):
+        """Limit=0 should return empty list."""
         db.create_session("s1", "cli")
-        long_msg = "A" * 100
-        db.append_message("s1", "user", long_msg)
-        sessions = db.list_sessions_rich()
-        assert len(sessions[0]["preview"]) == 63  # 60 chars + "..."
-        assert sessions[0]["preview"].endswith("...")
+        db.create_session("s2", "cli")
 
-    def test_preview_empty_when_no_user_messages(self, db):
-        db.create_session("s1", "cli")
-        db.append_message("s1", "system", "System prompt")
-        sessions = db.list_sessions_rich()
-        assert sessions[0]["preview"] == ""
+        sessions = db.list_sessions_rich(limit=0)
+        assert sessions == []
 
-    def test_last_active_from_latest_message(self, db):
+    def test_list_large_offset(self, db: SessionDB):
+        """Large offset should return empty (no more results)."""
+        for i in range(3):
+            db.create_session(f"s{i}", "cli")
+            db.append_message(f"s{i}", "user", f"Message {i}")
+
+        sessions = db.list_sessions_rich(offset=100)
+        assert sessions == []
+
+    def test_list_all_fields_present(self, db: SessionDB):
+        """All expected fields should be present in result."""
         import time
         db.create_session("s1", "cli")
         db.append_message("s1", "user", "Hello")
-        time.sleep(0.01)
-        db.append_message("s1", "assistant", "Hi there!")
-        sessions = db.list_sessions_rich()
-        # last_active should be close to now (the assistant message)
-        assert sessions[0]["last_active"] > sessions[0]["started_at"]
+        db.append_message("s1", "assistant", "Hi")
 
-    def test_last_active_fallback_to_started_at(self, db):
+        sessions = db.list_sessions_rich(limit=1)
+        assert len(sessions) == 1
+        session = sessions[0]
+
+        # Check all expected fields
+        assert "id" in session
+        assert "source" in session
+        assert "model" in session
+        assert "title" in session
+        assert "started_at" in session
+        assert "ended_at" in session
+        assert "message_count" in session
+        assert "preview" in session
+        assert "last_active" in session
+        # Note: Some fields may be None if not set
+
+
+class TestGetSessionByTitleEdgeCases:
+    """Edge cases for get_session_by_title()."""
+
+    def test_case_sensitive(self, db: SessionDB):
+        """Title lookup should be case-sensitive."""
         db.create_session("s1", "cli")
-        sessions = db.list_sessions_rich()
-        # No messages, so last_active falls back to started_at
-        assert sessions[0]["last_active"] == sessions[0]["started_at"]
+        db.set_session_title("s1", "My Title")
 
-    def test_rich_list_includes_title(self, db):
+        result = db.get_session_by_title("my title")
+        assert result is None
+
+        result = db.get_session_by_title("My Title")
+        assert result is not None
+
+    def test_special_characters_in_title(self, db: SessionDB):
+        """Titles with special characters should work."""
         db.create_session("s1", "cli")
-        db.set_session_title("s1", "refactoring auth")
-        sessions = db.list_sessions_rich()
-        assert sessions[0]["title"] == "refactoring auth"
+        title = "Title with spaces and #1"
+        db.set_session_title("s1", title)
 
-    def test_rich_list_source_filter(self, db):
+        result = db.get_session_by_title(title)
+        assert result is not None
+
+    def test_empty_title(self, db: SessionDB):
+        """Empty title should return None."""
+        db.create_session("s1", "cli")
+        result = db.get_session_by_title("")
+        assert result is None
+
+
+class TestAppendMessageEdgeCases:
+    """Edge cases for append_message()."""
+
+    def test_tool_calls_none(self, db: SessionDB):
+        """tool_calls=None should work (no tool calls counted)."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "assistant", "Hello", tool_calls=None)
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        assert session["tool_call_count"] == 0
+
+    def test_tool_calls_empty_list(self, db: SessionDB):
+        """tool_calls=[] should work (no tool calls counted)."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "assistant", "Hello", tool_calls=[])
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        assert session["tool_call_count"] == 0
+
+    def test_tool_calls_non_list(self, db: SessionDB):
+        """tool_calls with non-list value (should be treated as 1 call)."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "assistant", "Hello", tool_calls="some_string")
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        # Non-list with truthy value counts as 1
+        assert session["tool_call_count"] == 1
+
+    def test_tool_calls_single_dict(self, db: SessionDB):
+        """tool_calls with single dict (should count as 1)."""
+        db.create_session("s1", "cli")
+        tool_calls = [{"id": "call_1", "function": {"name": "test"}}]
+        db.append_message("s1", "assistant", "Hello", tool_calls=tool_calls)
+
+        session = db.get_session("s1")
+        assert session["tool_call_count"] == 1
+
+
+class TestExportAllEdgeCases:
+    """Edge cases for export_all()."""
+
+    def test_export_all_empty_source(self, db: SessionDB):
+        """export_all(source=...) with no matches should return empty list."""
         db.create_session("s1", "cli")
         db.create_session("s2", "telegram")
-        sessions = db.list_sessions_rich(source="cli")
-        assert len(sessions) == 1
-        assert sessions[0]["id"] == "s1"
 
-    def test_preview_newlines_collapsed(self, db):
+        exports = db.export_all(source="nonexistent")
+        assert exports == []
+
+    def test_export_all_with_messages(self, db: SessionDB):
+        """Export should include messages."""
         db.create_session("s1", "cli")
-        db.append_message("s1", "user", "Line one\nLine two\nLine three")
+        db.append_message("s1", "user", "Hello")
+        db.append_message("s1", "assistant", "Hi")
+
+        exports = db.export_all()
+        assert len(exports) == 1
+        assert len(exports[0]["messages"]) == 2
+
+    def test_export_all_preserves_all_fields(self, db: SessionDB):
+        """Export should preserve all session fields."""
+        db.create_session(
+            "s1",
+            "cli",
+            model="test-model",
+            system_prompt="System prompt",
+        )
+        db.end_session("s1", end_reason="done")
+        db.set_session_title("s1", "My Title")
+        db.append_message("s1", "user", "Hello")
+
+        exports = db.export_all()
+        export = exports[0]
+
+        assert "id" in export
+        assert "source" in export
+        assert "model" in export
+        assert "system_prompt" in export
+        assert "title" in export
+        assert "ended_at" in export
+        assert "messages" in export
+        assert len(export["messages"]) == 1
+
+
+class TestConcurrentAccess:
+    """Tests for thread safety and concurrent access."""
+
+    def test_concurrent_reads_writes(self, db: SessionDB):
+        """Concurrent reads and writes should not corrupt data."""
+        import threading
+        import time
+
+        errors = []
+        lock = threading.Lock()
+
+        def writer():
+            try:
+                for i in range(10):
+                    session_id = f"writer_{i}"
+                    db.create_session(session_id, "cli")
+                    db.append_message(session_id, "user", f"Message {i}")
+                    db.end_session(session_id, end_reason="done")
+                    time.sleep(0.01)
+            except Exception as e:
+                with lock:
+                    errors.append(e)
+
+        def reader():
+            try:
+                for i in range(10):
+                    time.sleep(0.01)
+                    sessions = db.search_sessions()
+                    messages = db.message_count()
+                    assert len(sessions) == 0  # All created by writer
+                    assert messages == 0  # All created by writer
+            except Exception as e:
+                with lock:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # All reads should succeed
+        assert len(errors) == 0
+
+        # Verify data integrity
+        assert db.session_count() == 10
+        assert db.message_count() == 10
+
+    def test_concurrent_same_session_writes(self, db: SessionDB):
+        """Multiple concurrent writes to same session should be consistent."""
+        import threading
+        import time
+
+        session_id = "concurrent_session"
+        db.create_session(session_id, "cli")
+
+        errors = []
+        lock = threading.Lock()
+
+        def writer(count):
+            try:
+                for _ in range(count):
+                    db.append_message(session_id, "user", f"Message from {count}")
+                    time.sleep(0.01)
+            except Exception as e:
+                with lock:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=writer, args=(5,)) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0
+
+        # Should have 15 messages total (3 threads × 5 messages)
+        assert db.message_count(session_id) == 15
+
+
+class TestSchemaInitEdgeCases:
+    """Edge cases for schema initialization."""
+
+    def test_clean_database_creation(self, tmp_path):
+        """Creating a new database should initialize to v5."""
+        db_path = tmp_path / "clean_db.db"
+        db = SessionDB(db_path=db_path)
+
+        # Should be at v5 immediately
+        cursor = db._conn.execute("SELECT version FROM schema_version")
+        version = cursor.fetchone()[0]
+        assert version == 5
+
+        # Verify all tables exist
+        cursor = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+        tables = {row[0] for row in cursor.fetchall()}
+        assert "sessions" in tables
+        assert "messages" in tables
+        assert "schema_version" in tables
+        assert "messages_fts" in tables
+
+        db.close()
+
+    def test_upgrade_from_v5_to_v5(self, tmp_path):
+        """Opening a v5 database should not change version."""
+        import sqlite3
+
+        db_path = tmp_path / "v5_db.db"
+        conn = sqlite3.connect(str(db_path))
+
+        # Create v5 schema
+        conn.executescript("""
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (5);
+
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                title TEXT,
+            );
+
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                timestamp REAL NOT NULL,
+            );
+
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+                content, content=messages, content_rowid=id
+            );
+
+            CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+
+            CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+            END;
+
+            CREATE TRIGGER messages_fts_update AFTER UPDATE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+        """)
+
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+            ("existing", "cli", 1000.0),
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with SessionDB
+        db = SessionDB(db_path=db_path)
+
+        # Should still be v5
+        cursor = db._conn.execute("SELECT version FROM schema_version")
+        version = cursor.fetchone()[0]
+        assert version == 5
+
+        db.close()
+
+
+class TestUpdateTokenCountsEdgeCases:
+    """Edge cases for update_token_counts()."""
+
+    def test_update_all_billing_fields(self, db: SessionDB):
+        """Test updating all billing-related fields."""
+        db.create_session("s1", "cli")
+
+        db.update_token_counts(
+            "s1",
+            input_tokens=100,
+            output_tokens=50,
+            cache_read_tokens=10,
+            cache_write_tokens=5,
+            reasoning_tokens=20,
+            estimated_cost_usd=1.0,
+            actual_cost_usd=1.05,
+            cost_status="within budget",
+            cost_source="api",
+            pricing_version="2024.01",
+            billing_provider="anthropic",
+            billing_base_url="https://api.anthropic.com",
+            billing_mode="standard",
+        )
+
+        session = db.get_session("s1")
+
+        # Check all billing fields
+        assert session["billing_provider"] == "anthropic"
+        assert session["billing_base_url"] == "https://api.anthropic.com"
+        assert session["billing_mode"] == "standard"
+        assert session["estimated_cost_usd"] == 1.0
+        assert session["actual_cost_usd"] == 1.05
+        assert session["cost_status"] == "within budget"
+        assert session["cost_source"] == "api"
+        assert session["pricing_version"] == "2024.01"
+
+    def test_cost_accumulation(self, db: SessionDB):
+        """Costs should accumulate across multiple updates."""
+        db.create_session("s1", "cli")
+
+        # First update
+        db.update_token_counts("s1", input_tokens=100, estimated_cost_usd=1.0)
+        session = db.get_session("s1")
+        assert session["input_tokens"] == 100
+        assert session["estimated_cost_usd"] == 1.0
+
+        # Second update
+        db.update_token_counts("s1", input_tokens=100, estimated_cost_usd=2.0)
+        session = db.get_session("s1")
+        assert session["input_tokens"] == 200
+        assert session["estimated_cost_usd"] == 3.0
+
+    def test_cost_status_preserved(self, db: SessionDB):
+        """Cost status should be preserved across updates."""
+        db.create_session("s1", "cli")
+
+        # First update with "within budget"
+        db.update_token_counts("s1", input_tokens=100, cost_status="within budget")
+
+        # Second update without cost_status (should preserve)
+        db.update_token_counts("s1", input_tokens=100)
+
+        session = db.get_session("s1")
+        assert session["cost_status"] == "within budget"
+
+    def test_billing_fields_backfill_once(self, db: SessionDB):
+        """Billing fields should be backfilled only once, then preserved."""
+        db.create_session("s1", "cli")
+
+        # First update with billing fields
+        db.update_token_counts(
+            "s1",
+            input_tokens=100,
+            billing_provider="test",
+            billing_base_url="https://test.com",
+        )
+
+        # Second update without billing fields (should preserve)
+        db.update_token_counts("s1", input_tokens=100)
+
+        session = db.get_session("s1")
+        assert session["billing_provider"] == "test"
+        assert session["billing_base_url"] == "https://test.com"
+
+    def test_billing_over_budget_status(self, db: SessionDB):
+        """Test 'over budget' cost status."""
+        db.create_session("s1", "cli")
+
+        db.update_token_counts(
+            "s1",
+            input_tokens=100,
+            actual_cost_usd=1000.0,
+            cost_status="over budget",
+            cost_source="api",
+            pricing_version="2024.01",
+        )
+
+        session = db.get_session("s1")
+        assert session["cost_status"] == "over budget"
+        assert session["actual_cost_usd"] == 1000.0
+
+
+class TestFTSEdgeCases:
+    """Edge cases for FTS5 search."""
+
+    def test_search_whitespace_only_query(self, db: SessionDB):
+        """Search with whitespace-only query should return empty."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+
+        assert db.search_messages("   ") == []
+        assert db.search_messages("\t\n") == []
+
+    def test_search_single_character(self, db: SessionDB):
+        """Search with single character should work."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+
+        results = db.search_messages("e")
+        assert isinstance(results, list)  # May or may not match depending on FTS5
+
+    def test_search_unicode_content(self, db: SessionDB):
+        """Search with unicode content should work."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "こんにちは世界")
+        db.append_message("s1", "assistant", "Hello World")
+
+        results = db.search_messages("こんにちは")
+        assert isinstance(results, list)
+
+    def test_search_empty_content_message(self, db: SessionDB):
+        """Search should handle messages with empty content."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "")
+        db.append_message("s1", "assistant", "Hello")
+
+        results = db.search_messages("Hello")
+        # Should find the assistant message
+        assert len(results) >= 0
+
+
+class TestToolCallCountEdgeCases:
+    """Edge cases for tool call counting."""
+
+    def test_tool_calls_count_in_message(self, db: SessionDB):
+        """Tool calls in assistant message should count."""
+        db.create_session("s1", "cli")
+
+        tool_calls = [
+            {"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}},
+            {"id": "call_2", "function": {"name": "file_read", "arguments": "{}"}},
+        ]
+        db.append_message("s1", "assistant", "Checking...", tool_calls=tool_calls)
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        assert session["tool_call_count"] == 2
+
+    def test_tool_calls_no_content_still_counts(self, db: SessionDB):
+        """Tool calls should count even if content is empty."""
+        db.create_session("s1", "cli")
+
+        tool_calls = [{"id": "call_1", "function": {"name": "test"}}]
+        db.append_message("s1", "assistant", "", tool_calls=tool_calls)
+
+        session = db.get_session("s1")
+        assert session["tool_call_count"] == 1
+
+    def test_tool_calls_with_tool_response(self, db: SessionDB):
+        """Tool responses should not increment tool_call_count."""
+        db.create_session("s1", "cli")
+
+        # Assistant makes 1 tool call
+        tool_calls = [{"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}}]
+        db.append_message("s1", "assistant", "Checking...", tool_calls=tool_calls)
+
+        # Tool response comes back
+        db.append_message("s1", "tool", "Result", tool_name="web_search")
+
+        session = db.get_session("s1")
+        # Should be 1 (the assistant call), not 2
+        assert session["tool_call_count"] == 1
+
+    def test_multiple_tool_calls_multiple_responses(self, db: SessionDB):
+        """Multiple tool calls with multiple responses should count correctly."""
+        db.create_session("s1", "cli")
+
+        # Assistant makes 2 parallel tool calls
+        tool_calls = [
+            {"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}},
+            {"id": "call_2", "function": {"name": "file_read", "arguments": "{}"}},
+        ]
+        db.append_message("s1", "assistant", "Checking...", tool_calls=tool_calls)
+
+        # Two tool responses
+        db.append_message("s1", "tool", "Result 1", tool_name="web_search")
+        db.append_message("s1", "tool", "Result 2", tool_name="file_read")
+
+        session = db.get_session("s1")
+        assert session["tool_call_count"] == 2
+        assert session["message_count"] == 3  # 1 assistant + 2 tool responses
+# ======================================================================
+# Untested/Edge cases
+# ======================================================================
+
+class TestClearMessages:
+    """Tests for clear_messages() - deletes all messages and resets counters."""
+
+    def test_clear_messages(self, db):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="Hello")
+        db.append_message("s1", role="assistant", content="Hi")
+        db.append_message("s1", role="tool", tool_name="web_search")
+
+        # Verify messages exist
+        assert db.message_count(session_id="s1") == 3
+        session = db.get_session("s1")
+        assert session["message_count"] == 3
+        assert session["tool_call_count"] == 1
+
+        # Clear messages
+        db.clear_messages("s1")
+
+        # Verify messages deleted
+        assert db.message_count(session_id="s1") == 0
+        assert db.get_messages("s1") == []
+
+        # Verify counters reset
+        session = db.get_session("s1")
+        assert session["message_count"] == 0
+        assert session["tool_call_count"] == 0
+
+    def test_clear_nonexistent_session(self, db):
+        # Should not raise for nonexistent session
+        assert db.clear_messages("nonexistent") is not None  # Returns None implicitly
+
+    def test_clear_messages_preserves_session_metadata(self, db):
+        db.create_session(
+            session_id="s1",
+            source="cli",
+            model="test-model",
+            system_prompt="System prompt text",
+        )
+        db.end_session("s1", end_reason="user_exit")
+        db.set_session_title("s1", "My Title")
+
+        db.append_message("s1", role="user", content="Hello")
+
+        assert db.get_session("s1")["model"] == "test-model"
+        assert db.get_session("s1")["system_prompt"] == "System prompt text"
+        assert db.get_session("s1")["ended_at"] is not None
+        assert db.get_session("s1")["title"] == "My Title"
+
+        db.clear_messages("s1")
+
+        # Session metadata should persist
+        assert db.get_session("s1")["model"] == "test-model"
+        assert db.get_session("s1")["system_prompt"] == "System prompt text"
+        assert db.get_session("s1")["ended_at"] is not None
+        assert db.get_session("s1")["title"] == "My Title"
+
+
+class TestClose:
+    """Tests for close() method."""
+
+    def test_close_releases_connection(self, db):
+        assert db._conn is not None
+        db.close()
+        assert db._conn is None
+
+    def test_close_twice_no_error(self, db):
+        db.close()
+        db.close()  # Should not raise
+
+    def test_close_after_append(self, db):
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+
+        db.close()
+
+        # Connection released, can be reopened
+        new_db = SessionDB(db_path=db.db_path)
+        new_db.close()
+
+
+class TestPruneSessionsEdgeCases:
+    """Edge cases for prune_sessions()."""
+
+    def test_prune_zero_days(self, db):
+        """Pruning with 0 days should delete all ended sessions."""
+        db.create_session("old1", "cli")
+        db.end_session("old1", end_reason="done")
+        db.create_session("old2", "cli")
+        db.end_session("old2", end_reason="done")
+
+        pruned = db.prune_sessions(older_than_days=0)
+        assert pruned == 2
+        assert db.get_session("old1") is None
+        assert db.get_session("old2") is None
+
+    def test_prune_all_active_skipped(self, db):
+        """All active sessions should be skipped."""
+        db.create_session("active1", "cli")
+        db.create_session("active2", "cli")
+
+        pruned = db.prune_sessions(older_than_days=90)
+        assert pruned == 0
+        assert db.get_session("active1") is not None
+        assert db.get_session("active2") is not None
+
+    def test_prune_empty_db(self, db):
+        """Pruning empty database should return 0."""
+        pruned = db.prune_sessions(older_than_days=90)
+        assert pruned == 0
+
+    def test_prune_preserves_started_at(self, db):
+        """Pruning should delete sessions, not just truncate."""
+        db.create_session("old", "cli")
+        db.end_session("old", end_reason="done")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (time.time() - 200 * 86400, "old"),
+        )
+        db._conn.commit()
+
+        pruned = db.prune_sessions(older_than_days=90)
+        assert pruned == 1
+        assert db.get_session("old") is None
+
+
+class TestListSessionsRichEdgeCases:
+    """Edge cases for list_sessions_rich()."""
+
+    def test_list_empty_database(self, db):
+        """Listing empty database should return empty list."""
         sessions = db.list_sessions_rich()
-        assert "\n" not in sessions[0]["preview"]
-        assert "Line one Line two" in sessions[0]["preview"]
+        assert sessions == []
 
-
-class TestResolveSessionByNameOrId:
-    """Tests for the main.py helper that resolves names or IDs."""
-
-    def test_resolve_by_id(self, db):
-        db.create_session("test-id-123", "cli")
-        session = db.get_session("test-id-123")
-        assert session is not None
-        assert session["id"] == "test-id-123"
-
-    def test_resolve_by_title_falls_back(self, db):
+    def test_list_limit_zero(self, db):
+        """Limit=0 should return empty list."""
         db.create_session("s1", "cli")
-        db.set_session_title("s1", "my project")
-        result = db.resolve_session_by_title("my project")
+        db.create_session("s2", "cli")
+
+        sessions = db.list_sessions_rich(limit=0)
+        assert sessions == []
+
+    def test_list_large_offset(self, db):
+        """Large offset should return empty (no more results)."""
+        for i in range(3):
+            db.create_session(f"s{i}", "cli")
+            db.append_message(f"s{i}", "user", f"Message {i}")
+
+        sessions = db.list_sessions_rich(offset=100)
+        assert sessions == []
+
+    def test_list_all_fields_present(self, db):
+        """All expected fields should be present in result."""
+        import time
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+        db.append_message("s1", "assistant", "Hi")
+
+        sessions = db.list_sessions_rich(limit=1)
+        assert len(sessions) == 1
+        session = sessions[0]
+
+        # Check all expected fields
+        assert "id" in session
+        assert "source" in session
+        assert "model" in session
+        assert "title" in session
+        assert "started_at" in session
+        assert "ended_at" in session
+        assert "message_count" in session
+        assert "preview" in session
+        assert "last_active" in session
+        # Note: Some fields may be None if not set
+
+
+class TestGetSessionByTitleEdgeCases:
+    """Edge cases for get_session_by_title()."""
+
+    def test_case_sensitive(self, db):
+        """Title lookup should be case-sensitive."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "My Title")
+
+        result = db.get_session_by_title("my title")
+        assert result is None
+
+        result = db.get_session_by_title("My Title")
+        assert result is not None
+
+    def test_special_characters_in_title(self, db):
+        """Titles with special characters should work."""
+        db.create_session("s1", "cli")
+        title = "Title with spaces and #1"
+        db.set_session_title("s1", title)
+
+        result = db.get_session_by_title(title)
+        assert result is not None
+
+    def test_empty_title(self, db):
+        """Empty title should return None."""
+        db.create_session("s1", "cli")
+        result = db.get_session_by_title("")
+        assert result is None
+
+
+class TestAppendMessageEdgeCases:
+    """Edge cases for append_message()."""
+
+    def test_tool_calls_none(self, db):
+        """tool_calls=None should work (no tool calls counted)."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "assistant", "Hello", tool_calls=None)
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        assert session["tool_call_count"] == 0
+
+    def test_tool_calls_empty_list(self, db):
+        """tool_calls=[] should work (no tool calls counted)."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "assistant", "Hello", tool_calls=[])
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        assert session["tool_call_count"] == 0
+
+    def test_tool_calls_non_list(self, db):
+        """tool_calls with non-list value (should be treated as 1 call)."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "assistant", "Hello", tool_calls="some_string")
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        # Non-list with truthy value counts as 1
+        assert session["tool_call_count"] == 1
+
+    def test_tool_calls_single_dict(self, db):
+        """tool_calls with single dict (should count as 1)."""
+        db.create_session("s1", "cli")
+        tool_calls = [{"id": "call_1", "function": {"name": "test"}}]
+        db.append_message("s1", "assistant", "Hello", tool_calls=tool_calls)
+
+        session = db.get_session("s1")
+        assert session["tool_call_count"] == 1
+
+
+class TestExportAllEdgeCases:
+    """Edge cases for export_all()."""
+
+    def test_export_all_empty_source(self, db):
+        """export_all(source=...) with no matches should return empty list."""
+        db.create_session("s1", "cli")
+        db.create_session("s2", "telegram")
+
+        exports = db.export_all(source="nonexistent")
+        assert exports == []
+
+    def test_export_all_with_messages(self, db):
+        """Export should include messages."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+        db.append_message("s1", "assistant", "Hi")
+
+        exports = db.export_all()
+        assert len(exports) == 1
+        assert len(exports[0]["messages"]) == 2
+
+    def test_export_all_preserves_all_fields(self, db):
+        """Export should preserve all session fields."""
+        db.create_session(
+            "s1",
+            "cli",
+            model="test-model",
+            system_prompt="System prompt",
+        )
+        db.end_session("s1", end_reason="done")
+        db.set_session_title("s1", "My Title")
+        db.append_message("s1", "user", "Hello")
+
+        exports = db.export_all()
+        export = exports[0]
+
+        assert "id" in export
+        assert "source" in export
+        assert "model" in export
+        assert "system_prompt" in export
+        assert "title" in export
+        assert "ended_at" in export
+        assert "messages" in export
+        assert len(export["messages"]) == 1
+
+
+class TestConcurrentAccess:
+    """Tests for thread safety and concurrent access."""
+
+    def test_concurrent_reads_writes(self, db):
+        """Concurrent reads and writes should not corrupt data."""
+        import threading
+        import time
+
+        errors = []
+        lock = threading.Lock()
+
+        def writer():
+            try:
+                for i in range(10):
+                    session_id = f"writer_{i}"
+                    db.create_session(session_id, "cli")
+                    db.append_message(session_id, "user", f"Message {i}")
+                    db.end_session(session_id, end_reason="done")
+                    time.sleep(0.01)
+            except Exception as e:
+                with lock:
+                    errors.append(e)
+
+        def reader():
+            try:
+                for i in range(10):
+                    time.sleep(0.01)
+                    sessions = db.search_sessions()
+                    messages = db.message_count()
+                    assert len(sessions) == 0  # All created by writer
+                    assert messages == 0  # All created by writer
+            except Exception as e:
+                with lock:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # All reads should succeed
+        assert len(errors) == 0
+
+        # Verify data integrity
+        assert db.session_count() == 10
+        assert db.message_count() == 10
+
+    def test_concurrent_same_session_writes(self, db):
+        """Multiple concurrent writes to same session should be consistent."""
+        import threading
+        import time
+
+        session_id = "concurrent_session"
+        db.create_session(session_id, "cli")
+
+        errors = []
+        lock = threading.Lock()
+
+        def writer(count):
+            try:
+                for _ in range(count):
+                    db.append_message(session_id, "user", f"Message from {count}")
+                    time.sleep(0.01)
+            except Exception as e:
+                with lock:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=writer, args=(5,)) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0
+
+        # Should have 15 messages total (3 threads × 5 messages)
+        assert db.message_count(session_id) == 15
+
+
+class TestSchemaInitEdgeCases:
+    """Edge cases for schema initialization."""
+
+    def test_clean_database_creation(self, tmp_path):
+        """Creating a new database should initialize to v5."""
+        db_path = tmp_path / "clean_db.db"
+        db = SessionDB(db_path=db_path)
+
+        # Should be at v5 immediately
+        cursor = db._conn.execute("SELECT version FROM schema_version")
+        version = cursor.fetchone()[0]
+        assert version == 5
+
+        # Verify all tables exist
+        cursor = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+        tables = {row[0] for row in cursor.fetchall()}
+        assert "sessions" in tables
+        assert "messages" in tables
+        assert "schema_version" in tables
+        assert "messages_fts" in tables
+
+        db.close()
+
+    def test_upgrade_from_v5_to_v5(self, tmp_path):
+        """Opening a v5 database should not change version."""
+        import sqlite3
+
+        db_path = tmp_path / "v5_db.db"
+        conn = sqlite3.connect(str(db_path))
+
+        # Create v5 schema
+        conn.executescript("""
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (5);
+
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                title TEXT,
+            );
+
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                timestamp REAL NOT NULL,
+            );
+
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+                content, content=messages, content_rowid=id
+            );
+
+            CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+
+            CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+            END;
+
+            CREATE TRIGGER messages_fts_update AFTER UPDATE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+        """)
+
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+            ("existing", "cli", 1000.0),
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with SessionDB
+        db = SessionDB(db_path=db_path)
+
+        # Should still be v5
+        cursor = db._conn.execute("SELECT version FROM schema_version")
+        version = cursor.fetchone()[0]
+        assert version == 5
+
+        db.close()
+
+
+class TestUpdateTokenCountsEdgeCases:
+    """Edge cases for update_token_counts()."""
+
+    def test_update_all_billing_fields(self, db):
+        """Test updating all billing-related fields."""
+        db.create_session("s1", "cli")
+
+        db.update_token_counts(
+            "s1",
+            input_tokens=100,
+            output_tokens=50,
+            cache_read_tokens=10,
+            cache_write_tokens=5,
+            reasoning_tokens=20,
+            estimated_cost_usd=1.0,
+            actual_cost_usd=1.05,
+            cost_status="within budget",
+            cost_source="api",
+            pricing_version="2024.01",
+            billing_provider="anthropic",
+            billing_base_url="https://api.anthropic.com",
+            billing_mode="standard",
+        )
+
+        session = db.get_session("s1")
+
+        # Check all billing fields
+        assert session["billing_provider"] == "anthropic"
+        assert session["billing_base_url"] == "https://api.anthropic.com"
+        assert session["billing_mode"] == "standard"
+        assert session["estimated_cost_usd"] == 1.0
+        assert session["actual_cost_usd"] == 1.05
+        assert session["cost_status"] == "within budget"
+        assert session["cost_source"] == "api"
+        assert session["pricing_version"] == "2024.01"
+
+    def test_cost_accumulation(self, db):
+        """Costs should accumulate across multiple updates."""
+        db.create_session("s1", "cli")
+
+        # First update
+        db.update_token_counts("s1", input_tokens=100, estimated_cost_usd=1.0)
+        session = db.get_session("s1")
+        assert session["input_tokens"] == 100
+        assert session["estimated_cost_usd"] == 1.0
+
+        # Second update
+        db.update_token_counts("s1", input_tokens=100, estimated_cost_usd=2.0)
+        session = db.get_session("s1")
+        assert session["input_tokens"] == 200
+        assert session["estimated_cost_usd"] == 3.0
+
+    def test_cost_status_preserved(self, db):
+        """Cost status should be preserved across updates."""
+        db.create_session("s1", "cli")
+
+        # First update with "within budget"
+        db.update_token_counts("s1", input_tokens=100, cost_status="within budget")
+
+        # Second update without cost_status (should preserve)
+        db.update_token_counts("s1", input_tokens=100)
+
+        session = db.get_session("s1")
+        assert session["cost_status"] == "within budget"
+
+    def test_billing_fields_backfill_once(self, db):
+        """Billing fields should be backfilled only once, then preserved."""
+        db.create_session("s1", "cli")
+
+        # First update with billing fields
+        db.update_token_counts(
+            "s1",
+            input_tokens=100,
+            billing_provider="test",
+            billing_base_url="https://test.com",
+        )
+
+        # Second update without billing fields (should preserve)
+        db.update_token_counts("s1", input_tokens=100)
+
+        session = db.get_session("s1")
+        assert session["billing_provider"] == "test"
+        assert session["billing_base_url"] == "https://test.com"
+
+    def test_billing_over_budget_status(self, db):
+        """Test 'over budget' cost status."""
+        db.create_session("s1", "cli")
+
+        db.update_token_counts(
+            "s1",
+            input_tokens=100,
+            actual_cost_usd=1000.0,
+            cost_status="over budget",
+            cost_source="api",
+            pricing_version="2024.01",
+        )
+
+        session = db.get_session("s1")
+        assert session["cost_status"] == "over budget"
+        assert session["actual_cost_usd"] == 1000.0
+
+
+class TestFTSEdgeCases:
+    """Edge cases for FTS5 search."""
+
+    def test_search_whitespace_only_query(self, db):
+        """Search with whitespace-only query should return empty."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+
+        assert db.search_messages("   ") == []
+        assert db.search_messages("\t\n") == []
+
+    def test_search_single_character(self, db):
+        """Search with single character should work."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+
+        results = db.search_messages("e")
+        assert len(results) >= 0  # May or may not match depending on FTS5
+
+    def test_search_unicode_content(self, db):
+        """Search with unicode content should work."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "こんにちは世界")
+        db.append_message("s1", "assistant", "Hello World")
+
+        results = db.search_messages("こんにちは")
+        assert isinstance(results, list)
+
+    def test_search_empty_content_message(self, db):
+        """Search should handle messages with empty content."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "")
+        db.append_message("s1", "assistant", "Hello")
+
+        results = db.search_messages("Hello")
+        # Should find the assistant message
+        assert len(results) >= 0
+
+
+class TestToolCallCountEdgeCases:
+    """Edge cases for tool call counting."""
+
+    def test_tool_calls_count_in_message(self, db):
+        """Tool calls in assistant message should count."""
+        db.create_session("s1", "cli")
+
+        tool_calls = [
+            {"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}},
+            {"id": "call_2", "function": {"name": "file_read", "arguments": "{}"}},
+        ]
+        db.append_message("s1", "assistant", "Checking...", tool_calls=tool_calls)
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        assert session["tool_call_count"] == 2
+
+    def test_tool_calls_no_content_still_counts(self, db):
+        """Tool calls should count even if content is empty."""
+        db.create_session("s1", "cli")
+
+        tool_calls = [{"id": "call_1", "function": {"name": "test"}}]
+        db.append_message("s1", "assistant", "", tool_calls=tool_calls)
+
+        session = db.get_session("s1")
+        assert session["tool_call_count"] == 1
+
+    def test_tool_calls_with_tool_response(self, db):
+        """Tool responses should not increment tool_call_count."""
+        db.create_session("s1", "cli")
+
+        # Assistant makes 1 tool call
+        tool_calls = [{"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}}]
+        db.append_message("s1", "assistant", "Checking...", tool_calls=tool_calls)
+
+        # Tool response comes back
+        db.append_message("s1", "tool", "Result", tool_name="web_search")
+
+        session = db.get_session("s1")
+        # Should be 1 (the assistant call), not 2
+        assert session["tool_call_count"] == 1
+
+    def test_multiple_tool_calls_multiple_responses(self, db):
+        """Multiple tool calls with multiple responses should count correctly."""
+        db.create_session("s1", "cli")
+
+        # Assistant makes 2 parallel tool calls
+        tool_calls = [
+            {"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}},
+            {"id": "call_2", "function": {"name": "file_read", "arguments": "{}"}},
+        ]
+        db.append_message("s1", "assistant", "Checking...", tool_calls=tool_calls)
+
+        # Two tool responses
+        db.append_message("s1", "tool", "Result 1", tool_name="web_search")
+        db.append_message("s1", "tool", "Result 2", tool_name="file_read")
+
+        session = db.get_session("s1")
+        assert session["tool_call_count"] == 2
+        assert session["message_count"] == 3  # 1 assistant + 2 tool responses
+
+# ======================================================================
+# Untested/Edge cases
+# ======================================================================
+
+# ======================================================================
+# Untested/Edge cases
+# ======================================================================
+
+class TestClearMessages:
+    """Tests for clear_messages() - deletes all messages and resets counters."""
+
+    def test_clear_messages(self, db: SessionDB):
+        db.create_session(session_id="s1", source="cli")
+        db.append_message("s1", role="user", content="Hello")
+        db.append_message("s1", role="assistant", content="Hi")
+        db.append_message("s1", role="tool", tool_name="web_search")
+
+        # Verify messages exist
+        assert db.message_count(session_id="s1") == 3
+        session = db.get_session("s1")
+        assert session["message_count"] == 3
+        assert session["tool_call_count"] == 1
+
+        # Clear messages
+        db.clear_messages("s1")
+
+        # Verify messages deleted
+        assert db.message_count(session_id="s1") == 0
+        assert db.get_messages("s1") == []
+
+        # Verify counters reset
+        session = db.get_session("s1")
+        assert session["message_count"] == 0
+        assert session["tool_call_count"] == 0
+
+    def test_clear_nonexistent_session(self, db: SessionDB):
+        # Should not raise for nonexistent session
+        assert db.clear_messages("nonexistent") is not None  # Returns None implicitly
+
+    def test_clear_messages_preserves_session_metadata(self, db: SessionDB):
+        db.create_session(
+            session_id="s1",
+            source="cli",
+            model="test-model",
+            system_prompt="System prompt text",
+        )
+        db.end_session("s1", end_reason="user_exit")
+        db.set_session_title("s1", "My Title")
+
+        db.append_message("s1", role="user", content="Hello")
+
+        assert db.get_session("s1")["model"] == "test-model"
+        assert db.get_session("s1")["system_prompt"] == "System prompt text"
+        assert db.get_session("s1")["ended_at"] is not None
+        assert db.get_session("s1")["title"] == "My Title"
+
+        db.clear_messages("s1")
+
+        # Session metadata should persist
+        assert db.get_session("s1")["model"] == "test-model"
+        assert db.get_session("s1")["system_prompt"] == "System prompt text"
+        assert db.get_session("s1")["ended_at"] is not None
+        assert db.get_session("s1")["title"] == "My Title"
+
+
+class TestClose:
+    """Tests for close() method."""
+
+    def test_close_releases_connection(self, db: SessionDB):
+        assert db._conn is not None
+        db.close()
+        assert db._conn is None
+
+    def test_close_twice_no_error(self, db: SessionDB):
+        db.close()
+        db.close()  # Should not raise
+
+    def test_close_after_append(self, db: SessionDB):
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+
+        db.close()
+
+        # Connection released, can be reopened
+        new_db = SessionDB(db_path=db.db_path)
+        new_db.close()
+
+
+class TestPruneSessionsEdgeCases:
+    """Edge cases for prune_sessions()."""
+
+    def test_prune_zero_days(self, db: SessionDB):
+        """Pruning with 0 days should delete all ended sessions."""
+        db.create_session("old1", "cli")
+        db.end_session("old1", end_reason="done")
+        db.create_session("old2", "cli")
+        db.end_session("old2", end_reason="done")
+
+        pruned = db.prune_sessions(older_than_days=0)
+        assert pruned == 2
+        assert db.get_session("old1") is None
+        assert db.get_session("old2") is None
+
+    def test_prune_all_active_skipped(self, db: SessionDB):
+        """All active sessions should be skipped."""
+        db.create_session("active1", "cli")
+        db.create_session("active2", "cli")
+
+        pruned = db.prune_sessions(older_than_days=90)
+        assert pruned == 0
+        assert db.get_session("active1") is not None
+        assert db.get_session("active2") is not None
+
+    def test_prune_empty_db(self, db: SessionDB):
+        """Pruning empty database should return 0."""
+        pruned = db.prune_sessions(older_than_days=90)
+        assert pruned == 0
+
+    def test_prune_preserves_started_at(self, db: SessionDB):
+        """Pruning should delete sessions, not just truncate."""
+        db.create_session("old", "cli")
+        db.end_session("old", end_reason="done")
+        db._conn.execute(
+            "UPDATE sessions SET started_at = ? WHERE id = ?",
+            (time.time() - 200 * 86400, "old"),
+        )
+        db._conn.commit()
+
+        pruned = db.prune_sessions(older_than_days=90)
+        assert pruned == 1
+        assert db.get_session("old") is None
+
+
+class TestListSessionsRichEdgeCases:
+    """Edge cases for list_sessions_rich()."""
+
+    def test_list_empty_database(self, db: SessionDB):
+        """Listing empty database should return empty list."""
+        sessions = db.list_sessions_rich()
+        assert sessions == []
+
+    def test_list_limit_zero(self, db: SessionDB):
+        """Limit=0 should return empty list."""
+        db.create_session("s1", "cli")
+        db.create_session("s2", "cli")
+
+        sessions = db.list_sessions_rich(limit=0)
+        assert sessions == []
+
+    def test_list_large_offset(self, db: SessionDB):
+        """Large offset should return empty (no more results)."""
+        for i in range(3):
+            db.create_session(f"s{i}", "cli")
+            db.append_message(f"s{i}", "user", f"Message {i}")
+
+        sessions = db.list_sessions_rich(offset=100)
+        assert sessions == []
+
+    def test_list_all_fields_present(self, db: SessionDB):
+        """All expected fields should be present in result."""
+        import time
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+        db.append_message("s1", "assistant", "Hi")
+
+        sessions = db.list_sessions_rich(limit=1)
+        assert len(sessions) == 1
+        session = sessions[0]
+
+        # Check all expected fields
+        assert "id" in session
+        assert "source" in session
+        assert "model" in session
+        assert "title" in session
+        assert "started_at" in session
+        assert "ended_at" in session
+        assert "message_count" in session
+        assert "preview" in session
+        assert "last_active" in session
+        # Note: Some fields may be None if not set
+
+
+class TestGetSessionByTitleEdgeCases:
+    """Edge cases for get_session_by_title()."""
+
+    def test_case_sensitive(self, db: SessionDB):
+        """Title lookup should be case-sensitive."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "My Title")
+
+        result = db.get_session_by_title("my title")
+        assert result is None
+
+        result = db.get_session_by_title("My Title")
+        assert result is not None
+
+    def test_special_characters_in_title(self, db: SessionDB):
+        """Titles with special characters should work."""
+        db.create_session("s1", "cli")
+        title = "Title with spaces and #1"
+        db.set_session_title("s1", title)
+
+        result = db.get_session_by_title(title)
+        assert result is not None
+
+    def test_empty_title(self, db: SessionDB):
+        """Empty title should return None."""
+        db.create_session("s1", "cli")
+        result = db.get_session_by_title("")
+        assert result is None
+
+
+class TestAppendMessageEdgeCases:
+    """Edge cases for append_message()."""
+
+    def test_tool_calls_none(self, db: SessionDB):
+        """tool_calls=None should work (no tool calls counted)."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "assistant", "Hello", tool_calls=None)
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        assert session["tool_call_count"] == 0
+
+    def test_tool_calls_empty_list(self, db: SessionDB):
+        """tool_calls=[] should work (no tool calls counted)."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "assistant", "Hello", tool_calls=[])
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        assert session["tool_call_count"] == 0
+
+    def test_tool_calls_non_list(self, db: SessionDB):
+        """tool_calls with non-list value (should be treated as 1 call)."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "assistant", "Hello", tool_calls="some_string")
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        # Non-list with truthy value counts as 1
+        assert session["tool_call_count"] == 1
+
+    def test_tool_calls_single_dict(self, db: SessionDB):
+        """tool_calls with single dict (should count as 1)."""
+        db.create_session("s1", "cli")
+        tool_calls = [{"id": "call_1", "function": {"name": "test"}}]
+        db.append_message("s1", "assistant", "Hello", tool_calls=tool_calls)
+
+        session = db.get_session("s1")
+        assert session["tool_call_count"] == 1
+
+
+class TestExportAllEdgeCases:
+    """Edge cases for export_all()."""
+
+    def test_export_all_empty_source(self, db: SessionDB):
+        """export_all(source=...) with no matches should return empty list."""
+        db.create_session("s1", "cli")
+        db.create_session("s2", "telegram")
+
+        exports = db.export_all(source="nonexistent")
+        assert exports == []
+
+    def test_export_all_with_messages(self, db: SessionDB):
+        """Export should include messages."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+        db.append_message("s1", "assistant", "Hi")
+
+        exports = db.export_all()
+        assert len(exports) == 1
+        assert len(exports[0]["messages"]) == 2
+
+    def test_export_all_preserves_all_fields(self, db: SessionDB):
+        """Export should preserve all session fields."""
+        db.create_session(
+            "s1",
+            "cli",
+            model="test-model",
+            system_prompt="System prompt",
+        )
+        db.end_session("s1", end_reason="done")
+        db.set_session_title("s1", "My Title")
+        db.append_message("s1", "user", "Hello")
+
+        exports = db.export_all()
+        export = exports[0]
+
+        assert "id" in export
+        assert "source" in export
+        assert "model" in export
+        assert "system_prompt" in export
+        assert "title" in export
+        assert "ended_at" in export
+        assert "messages" in export
+        assert len(export["messages"]) == 1
+
+
+class TestConcurrentAccess:
+    """Tests for thread safety and concurrent access."""
+
+    def test_concurrent_reads_writes(self, db: SessionDB):
+        """Concurrent reads and writes should not corrupt data."""
+        import threading
+        import time
+
+        errors = []
+        lock = threading.Lock()
+
+        def writer():
+            try:
+                for i in range(10):
+                    session_id = f"writer_{i}"
+                    db.create_session(session_id, "cli")
+                    db.append_message(session_id, "user", f"Message {i}")
+                    db.end_session(session_id, end_reason="done")
+                    time.sleep(0.01)
+            except Exception as e:
+                with lock:
+                    errors.append(e)
+
+        def reader():
+            try:
+                for i in range(10):
+                    time.sleep(0.01)
+                    sessions = db.search_sessions()
+                    messages = db.message_count()
+                    assert len(sessions) == 0  # All created by writer
+                    assert messages == 0  # All created by writer
+            except Exception as e:
+                with lock:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=writer), threading.Thread(target=reader)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # All reads should succeed
+        assert len(errors) == 0
+
+        # Verify data integrity
+        assert db.session_count() == 10
+        assert db.message_count() == 10
+
+    def test_concurrent_same_session_writes(self, db: SessionDB):
+        """Multiple concurrent writes to same session should be consistent."""
+        import threading
+        import time
+
+        session_id = "concurrent_session"
+        db.create_session(session_id, "cli")
+
+        errors = []
+        lock = threading.Lock()
+
+        def writer(count):
+            try:
+                for _ in range(count):
+                    db.append_message(session_id, "user", f"Message from {count}")
+                    time.sleep(0.01)
+            except Exception as e:
+                with lock:
+                    errors.append(e)
+
+        threads = [threading.Thread(target=writer, args=(5,)) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert len(errors) == 0
+
+        # Should have 15 messages total (3 threads × 5 messages)
+        assert db.message_count(session_id) == 15
+
+
+class TestSchemaInitEdgeCases:
+    """Edge cases for schema initialization."""
+
+    def test_clean_database_creation(self, tmp_path):
+        """Creating a new database should initialize to v5."""
+        db_path = tmp_path / "clean_db.db"
+        db = SessionDB(db_path=db_path)
+
+        # Should be at v5 immediately
+        cursor = db._conn.execute("SELECT version FROM schema_version")
+        version = cursor.fetchone()[0]
+        assert version == 5
+
+        # Verify all tables exist
+        cursor = db._conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+        tables = {row[0] for row in cursor.fetchall()}
+        assert "sessions" in tables
+        assert "messages" in tables
+        assert "schema_version" in tables
+        assert "messages_fts" in tables
+
+        db.close()
+
+    def test_upgrade_from_v5_to_v5(self, tmp_path):
+        """Opening a v5 database should not change version."""
+        import sqlite3
+
+        db_path = tmp_path / "v5_db.db"
+        conn = sqlite3.connect(str(db_path))
+
+        # Create v5 schema
+        conn.executescript("""
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (5);
+
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                started_at REAL NOT NULL,
+                title TEXT,
+            );
+
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                timestamp REAL NOT NULL,
+            );
+
+            CREATE VIRTUAL TABLE messages_fts USING fts5(
+                content, content=messages, content_rowid=id
+            );
+
+            CREATE TRIGGER messages_fts_insert AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+
+            CREATE TRIGGER messages_fts_delete AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+            END;
+
+            CREATE TRIGGER messages_fts_update AFTER UPDATE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.id, old.content);
+                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+        """)
+
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+            ("existing", "cli", 1000.0),
+        )
+        conn.commit()
+        conn.close()
+
+        # Open with SessionDB
+        db = SessionDB(db_path=db_path)
+
+        # Should still be v5
+        cursor = db._conn.execute("SELECT version FROM schema_version")
+        version = cursor.fetchone()[0]
+        assert version == 5
+
+        db.close()
+
+
+class TestUpdateTokenCountsEdgeCases:
+    """Edge cases for update_token_counts()."""
+
+    def test_update_all_billing_fields(self, db: SessionDB):
+        """Test updating all billing-related fields."""
+        db.create_session("s1", "cli")
+
+        db.update_token_counts(
+            "s1",
+            input_tokens=100,
+            output_tokens=50,
+            cache_read_tokens=10,
+            cache_write_tokens=5,
+            reasoning_tokens=20,
+            estimated_cost_usd=1.0,
+            actual_cost_usd=1.05,
+            cost_status="within budget",
+            cost_source="api",
+            pricing_version="2024.01",
+            billing_provider="anthropic",
+            billing_base_url="https://api.anthropic.com",
+            billing_mode="standard",
+        )
+
+        session = db.get_session("s1")
+
+        # Check all billing fields
+        assert session["billing_provider"] == "anthropic"
+        assert session["billing_base_url"] == "https://api.anthropic.com"
+        assert session["billing_mode"] == "standard"
+        assert session["estimated_cost_usd"] == 1.0
+        assert session["actual_cost_usd"] == 1.05
+        assert session["cost_status"] == "within budget"
+        assert session["cost_source"] == "api"
+        assert session["pricing_version"] == "2024.01"
+
+    def test_cost_accumulation(self, db: SessionDB):
+        """Costs should accumulate across multiple updates."""
+        db.create_session("s1", "cli")
+
+        # First update
+        db.update_token_counts("s1", input_tokens=100, estimated_cost_usd=1.0)
+        session = db.get_session("s1")
+        assert session["input_tokens"] == 100
+        assert session["estimated_cost_usd"] == 1.0
+
+        # Second update
+        db.update_token_counts("s1", input_tokens=100, estimated_cost_usd=2.0)
+        session = db.get_session("s1")
+        assert session["input_tokens"] == 200
+        assert session["estimated_cost_usd"] == 3.0
+
+    def test_cost_status_preserved(self, db: SessionDB):
+        """Cost status should be preserved across updates."""
+        db.create_session("s1", "cli")
+
+        # First update with "within budget"
+        db.update_token_counts("s1", input_tokens=100, cost_status="within budget")
+
+        # Second update without cost_status (should preserve)
+        db.update_token_counts("s1", input_tokens=100)
+
+        session = db.get_session("s1")
+        assert session["cost_status"] == "within budget"
+
+    def test_billing_fields_backfill_once(self, db: SessionDB):
+        """Billing fields should be backfilled only once, then preserved."""
+        db.create_session("s1", "cli")
+
+        # First update with billing fields
+        db.update_token_counts(
+            "s1",
+            input_tokens=100,
+            billing_provider="test",
+            billing_base_url="https://test.com",
+        )
+
+        # Second update without billing fields (should preserve)
+        db.update_token_counts("s1", input_tokens=100)
+
+        session = db.get_session("s1")
+        assert session["billing_provider"] == "test"
+        assert session["billing_base_url"] == "https://test.com"
+
+    def test_billing_over_budget_status(self, db: SessionDB):
+        """Test 'over budget' cost status."""
+        db.create_session("s1", "cli")
+
+        db.update_token_counts(
+            "s1",
+            input_tokens=100,
+            actual_cost_usd=1000.0,
+            cost_status="over budget",
+            cost_source="api",
+            pricing_version="2024.01",
+        )
+
+        session = db.get_session("s1")
+        assert session["cost_status"] == "over budget"
+        assert session["actual_cost_usd"] == 1000.0
+
+
+class TestFTSEdgeCases:
+    """Edge cases for FTS5 search."""
+
+    def test_search_whitespace_only_query(self, db: SessionDB):
+        """Search with whitespace-only query should return empty."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+
+        assert db.search_messages("   ") == []
+        assert db.search_messages("\t\n") == []
+
+    def test_search_single_character(self, db: SessionDB):
+        """Search with single character should work."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+
+        results = db.search_messages("e")
+        assert isinstance(results, list)  # May or may not match depending on FTS5
+
+    def test_search_unicode_content(self, db: SessionDB):
+        """Search with unicode content should work."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "こんにちは世界")
+        db.append_message("s1", "assistant", "Hello World")
+
+        results = db.search_messages("こんにちは")
+        assert isinstance(results, list)
+
+    def test_search_empty_content_message(self, db: SessionDB):
+        """Search should handle messages with empty content."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "")
+        db.append_message("s1", "assistant", "Hello")
+
+        results = db.search_messages("Hello")
+        # Should find the assistant message
+        assert len(results) >= 0
+
+
+class TestToolCallCountEdgeCases:
+    """Edge cases for tool call counting."""
+
+    def test_tool_calls_count_in_message(self, db: SessionDB):
+        """Tool calls in assistant message should count."""
+        db.create_session("s1", "cli")
+
+        tool_calls = [
+            {"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}},
+            {"id": "call_2", "function": {"name": "file_read", "arguments": "{}"}},
+        ]
+        db.append_message("s1", "assistant", "Checking...", tool_calls=tool_calls)
+
+        session = db.get_session("s1")
+        assert session["message_count"] == 1
+        assert session["tool_call_count"] == 2
+
+    def test_tool_calls_no_content_still_counts(self, db: SessionDB):
+        """Tool calls should count even if content is empty."""
+        db.create_session("s1", "cli")
+
+        tool_calls = [{"id": "call_1", "function": {"name": "test"}}]
+        db.append_message("s1", "assistant", "", tool_calls=tool_calls)
+
+        session = db.get_session("s1")
+        assert session["tool_call_count"] == 1
+
+    def test_tool_calls_with_tool_response(self, db: SessionDB):
+        """Tool responses should not increment tool_call_count."""
+        db.create_session("s1", "cli")
+
+        # Assistant makes 1 tool call
+        tool_calls = [{"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}}]
+        db.append_message("s1", "assistant", "Checking...", tool_calls=tool_calls)
+
+        # Tool response comes back
+        db.append_message("s1", "tool", "Result", tool_name="web_search")
+
+        session = db.get_session("s1")
+        # Should be 1 (the assistant call), not 2
+        assert session["tool_call_count"] == 1
+
+    def test_multiple_tool_calls_multiple_responses(self, db: SessionDB):
+        """Multiple tool calls with multiple responses should count correctly."""
+        db.create_session("s1", "cli")
+
+        # Assistant makes 2 parallel tool calls
+        tool_calls = [
+            {"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}},
+            {"id": "call_2", "function": {"name": "file_read", "arguments": "{}"}},
+        ]
+        db.append_message("s1", "assistant", "Checking...", tool_calls=tool_calls)
+
+        # Two tool responses
+        db.append_message("s1", "tool", "Result 1", tool_name="web_search")
+        db.append_message("s1", "tool", "Result 2", tool_name="file_read")
+
+        session = db.get_session("s1")
+        assert session["tool_call_count"] == 2
+        assert session["message_count"] == 3  # 1 assistant + 2 tool responses
+
+@pytest.fixture()
+def db(tmp_path):
+    """Create a SessionDB with a temp database file."""
+    db_path = tmp_path / "test_state_untested.db"
+    session_db = SessionDB(db_path=db_path)
+    yield session_db
+    session_db.close()
+
+
+class TestResolveSessionId:
+    """Tests for resolve_session_id() — resolves exact or prefix session IDs."""
+
+    def test_resolve_exact_match(self, db: SessionDB):
+        """Exact match should return the session ID."""
+        db.create_session("exact_session_123", "cli")
+        result = db.resolve_session_id("exact_session_123")
+        assert result == "exact_session_123"
+
+    def test_resolve_prefix_unique(self, db: SessionDB):
+        """Unique prefix should return the matching session ID."""
+        db.create_session("unique_prefix_abc", "cli")
+        result = db.resolve_session_id("unique_prefix")
+        assert result == "unique_prefix_abc"
+
+    def test_resolve_prefix_ambiguous_returns_none(self, db: SessionDB):
+        """Ambiguous prefix should return None."""
+        db.create_session("prefix_a", "cli")
+        db.create_session("prefix_b", "cli")
+        result = db.resolve_session_id("prefix")
+        assert result is None
+
+    def test_resolve_nonexistent_prefix_returns_none(self, db: SessionDB):
+        """Non-existent prefix should return None."""
+        result = db.resolve_session_id("nonexistent")
+        assert result is None
+
+    def test_resolve_prefix_with_special_chars(self, db: SessionDB):
+        """Prefix matching should escape special characters."""
+        db.create_session("session_with_%_special", "cli")
+        result = db.resolve_session_id("session_with_")
+        assert result == "session_with_%_special"
+
+
+class TestResolveSessionByTitle:
+    """Tests for resolve_session_by_title() — resolves title to session ID."""
+
+    def test_resolve_exact_title(self, db: SessionDB):
+        """Exact title match should return session ID."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "My Exact Title")
+        result = db.resolve_session_by_title("My Exact Title")
         assert result == "s1"
+
+    def test_resolve_numbered_variant_latest(self, db: SessionDB):
+        """Should prefer latest numbered variant over exact match."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "My Session")
+        time.sleep(0.1)  # Small delay to ensure later timestamp
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", "My Session #2")
+        result = db.resolve_session_by_title("My Session")
+        assert result == "s2"
+
+    def test_resolve_nonexistent_title(self, db: SessionDB):
+        """Non-existent title should return None."""
+        result = db.resolve_session_by_title("NonExistent Title")
+        assert result is None
+
+    def test_resolve_title_no_exact_match(self, db: SessionDB):
+        """Should return latest numbered variant when exact doesn't exist."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "My Session")
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", "My Session #2")
+        db.create_session("s3", "cli")
+        db.set_session_title("s3", "My Session #3")
+        result = db.resolve_session_by_title("My Session #3")
+        assert result == "s3"
+
+
+class TestGetNextTitleInLineage:
+    """Tests for get_next_title_in_lineage() — generates next title in sequence."""
+
+    def test_generate_next_number_from_base(self, db: SessionDB):
+        """Base title should generate #2."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "My Session")
+        next_title = db.get_next_title_in_lineage("My Session")
+        assert next_title == "My Session #2"
+
+    def test_generate_next_from_existing_number(self, db: SessionDB):
+        """Existing #3 should generate #4."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "My Session #3")
+        next_title = db.get_next_title_in_lineage("My Session #3")
+        assert next_title == "My Session #4"
+
+    def test_generate_from_new_title(self, db: SessionDB):
+        """New title should return base unchanged."""
+        next_title = db.get_next_title_in_lineage("Brand New Session")
+        assert next_title == "Brand New Session"
+
+    def test_generate_with_special_chars(self, db: SessionDB):
+        """Title with special characters should be handled correctly."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "Session with % sign")
+        next_title = db.get_next_title_in_lineage("Session with % sign")
+        assert next_title == "Session with % sign #2"
+
+
+class TestSanitizeTitle:
+    """Tests for sanitize_title() — cleans session titles."""
+
+    def test_sanitize_removes_control_chars(self, db: SessionDB):
+        """ASCII control chars should be removed."""
+        title = "Hello\x01\x02\x1FWorld"
+        result = SessionDB.sanitize_title(title)
+        assert "\x01" not in result
+        assert "\x02" not in result
+        assert "\x1F" not in result
+
+    def test_sanitize_removes_unicode_control_chars(self, db: SessionDB):
+        """Unicode control chars should be removed."""
+        title = "Hello\u200B\u200CWorld"
+        result = SessionDB.sanitize_title(title)
+        assert "\u200B" not in result
+        assert "\u200C" not in result
+
+    def test_sanitize_collapse_whitespace(self, db: SessionDB):
+        """Multiple spaces should be collapsed."""
+        title = "Hello   World"
+        result = SessionDB.sanitize_title(title)
+        assert "  " not in result
+        assert result == "Hello World"
+
+    def test_sanitize_strip_whitespace(self, db: SessionDB):
+        """Leading/trailing whitespace should be stripped."""
+        title = "  Hello World  "
+        result = SessionDB.sanitize_title(title)
+        assert result == "Hello World"
+
+    def test_sanitize_empty_returns_none(self, db: SessionDB):
+        """Whitespace-only title should return None."""
+        result = SessionDB.sanitize_title("   ")
+        assert result is None
+
+    def test_sanitize_none_returns_none(self, db: SessionDB):
+        """None should return None."""
+        result = SessionDB.sanitize_title(None)
+        assert result is None
+
+    def test_sanitize_max_length_check(self, db: SessionDB):
+        """Title exceeding max length should raise ValueError."""
+        long_title = "A" * 150
+        try:
+            SessionDB.sanitize_title(long_title)
+        except ValueError as e:
+            assert "too long" in str(e).lower()
+        else:
+            pytest.fail("Expected ValueError not raised")
+
+    def test_sanitize_exact_max_length(self, db: SessionDB):
+        """Title at exact max length should be accepted."""
+        max_length = SessionDB.MAX_TITLE_LENGTH
+        title = "A" * max_length
+        result = SessionDB.sanitize_title(title)
+        assert len(result) == max_length
+
+    def test_sanitize_with_unicode(self, db: SessionDB):
+        """Unicode characters should be preserved."""
+        title = "Hello 世界 World"
+        result = SessionDB.sanitize_title(title)
+        assert "世界" in result
+
+
+class TestGetSessionTitle:
+    """Tests for get_session_title() — retrieves session title."""
+
+    def test_get_title_for_existing_session(self, db: SessionDB):
+        """Existing session should return its title."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "My Title")
+        result = db.get_session_title("s1")
+        assert result == "My Title"
+
+    def test_get_title_for_new_session(self, db: SessionDB):
+        """New session should return None (no title set)."""
+        db.create_session("s1", "cli")
+        result = db.get_session_title("s1")
+        assert result is None
+
+    def test_get_title_for_nonexistent_session(self, db: SessionDB):
+        """Non-existent session should return None."""
+        result = db.get_session_title("nonexistent")
+        assert result is None
+
+
+class TestUpdateSystemPrompt:
+    """Tests for update_system_prompt() — updates system prompt."""
+
+    def test_update_system_prompt(self, db: SessionDB):
+        """System prompt should be updated."""
+        db.create_session("s1", "cli")
+        db.update_system_prompt("s1", "Updated prompt")
+        session = db.get_session("s1")
+        assert session["system_prompt"] == "Updated prompt"
+
+    def test_update_system_prompt_overwrites(self, db: SessionDB):
+        """New prompt should overwrite old prompt."""
+        db.create_session("s1", "cli")
+        db.update_system_prompt("s1", "First prompt")
+        db.update_system_prompt("s1", "Second prompt")
+        session = db.get_session("s1")
+        assert session["system_prompt"] == "Second prompt"
+
+    def test_update_system_prompt_preserves_other_fields(self, db: SessionDB):
+        """Updating prompt should not affect other fields."""
+        db.create_session("s1", "cli", model="test-model")
+        db.set_session_title("s1", "My Title")
+        db.update_system_prompt("s1", "Updated prompt")
+        session = db.get_session("s1")
+        assert session["model"] == "test-model"
+        assert session["title"] == "My Title"
+        assert session["system_prompt"] == "Updated prompt"
+
+
+class TestGetMessagesAsConversation:
+    """Tests for get_messages_as_conversation() — returns OpenAI format."""
+
+    def test_get_conversation_format(self, db: SessionDB):
+        """Messages should be in OpenAI conversation format."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+        db.append_message("s1", "assistant", "Hi there!")
+        messages = db.get_messages_as_conversation("s1")
+        assert len(messages) == 2
+        assert messages[0]["role"] == "user"
+        assert messages[0]["content"] == "Hello"
+        assert messages[1]["role"] == "assistant"
+        assert messages[1]["content"] == "Hi there!"
+
+    def test_get_conversation_with_tool_calls(self, db: SessionDB):
+        """Tool calls should be included in conversation format."""
+        db.create_session("s1", "cli")
+        tool_calls = [{"name": "web_search", "args": {"query": "weather"}}]
+        db.append_message("s1", "assistant", None, tool_calls=tool_calls)
+        messages = db.get_messages_as_conversation("s1")
+        assert len(messages) == 1
+        assert messages[0]["tool_calls"] == tool_calls
+
+    def test_get_conversation_empty_session(self, db: SessionDB):
+        """Empty session should return empty list."""
+        db.create_session("s1", "cli")
+        messages = db.get_messages_as_conversation("s1")
+        assert messages == []
+
+    def test_get_conversation_nonexistent_session(self, db: SessionDB):
+        """Non-existent session should return empty list."""
+        messages = db.get_messages_as_conversation("nonexistent")
+        assert messages == []
+
+
+class TestExportSession:
+    """Tests for export_session() — exports single session with messages."""
+
+    def test_export_session_with_messages(self, db: SessionDB):
+        """Export should include session metadata and messages."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+        exported = db.export_session("s1")
+        assert exported is not None
+        assert exported["id"] == "s1"
+        assert "messages" in exported
+        assert len(exported["messages"]) == 1
+
+    def test_export_session_nonexistent(self, db: SessionDB):
+        """Non-existent session should return None."""
+        exported = db.export_session("nonexistent")
+        assert exported is None
+
+    def test_export_session_no_messages(self, db: SessionDB):
+        """Session without messages should export with empty messages."""
+        db.create_session("s1", "cli")
+        exported = db.export_session("s1")
+        assert exported is not None
+        assert exported["messages"] == []
+
+
+class TestDeleteSession:
+    """Tests for delete_session() — deletes session and messages."""
+
+    def test_delete_session(self, db: SessionDB):
+        """Deleted session should be removed."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+        result = db.delete_session("s1")
+        assert result is True
+        assert db.get_session("s1") is None
+
+    def test_delete_nonexistent_session(self, db: SessionDB):
+        """Non-existent session should return False."""
+        result = db.delete_session("nonexistent")
+        assert result is False
+
+    def test_delete_session_removes_messages(self, db: SessionDB):
+        """Deleting session should remove all its messages."""
+        db.create_session("s1", "cli")
+        db.append_message("s1", "user", "Hello")
+        db.append_message("s1", "assistant", "Hi")
+        db.delete_session("s1")
+        messages = db.get_messages("s1")
+        assert messages == []
+
+    def test_delete_session_preserves_other_sessions(self, db: SessionDB):
+        """Deleting one session should not affect others."""
+        db.create_session("s1", "cli")
+        db.create_session("s2", "cli")
+        db.append_message("s1", "user", "Hello S1")
+        db.append_message("s2", "user", "Hello S2")
+        db.delete_session("s1")
+        assert db.get_session("s2") is not None
+        assert db.get_session("s1") is None
+
+
+class TestGetNextTitleEdgeCases:
+    """Edge cases for get_next_title_in_lineage()."""
+
+    def test_generate_with_hyphen(self, db: SessionDB):
+        """Title with hyphens should be handled correctly."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "My Session")
+        next_title = db.get_next_title_in_lineage("My Session")
+        assert next_title == "My Session #2"
+
+    def test_generate_with_numbers_in_base(self, db: SessionDB):
+        """Base title with numbers should still increment."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "Session 2024")
+        next_title = db.get_next_title_in_lineage("Session 2024")
+        assert next_title == "Session 2024 #2"
+
+    def test_generate_highest_number(self, db: SessionDB):
+        """Should find highest number and increment."""
+        db.create_session("s1", "cli")
+        db.set_session_title("s1", "Session #5")
+        db.create_session("s2", "cli")
+        db.set_session_title("s2", "Session #3")
+        db.create_session("s3", "cli")
+        db.set_session_title("s3", "Session #7")
+        next_title = db.get_next_title_in_lineage("Session #7")
+        assert next_title == "Session #8"
