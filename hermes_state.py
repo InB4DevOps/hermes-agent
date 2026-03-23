@@ -899,9 +899,19 @@ class SessionDB:
             results.append({**session, "messages": messages})
         return results
 
-    def clear_messages(self, session_id: str) -> None:
-        """Delete all messages for a session and reset its counters."""
+    def clear_messages(self, session_id: str) -> bool:
+        """Delete all messages for a session and reset its counters.
+        
+        Returns True if session existed and was cleared, False otherwise.
+        """
         with self._lock:
+            # Check if session exists first
+            cursor = self._conn.execute(
+                "SELECT id FROM sessions WHERE id = ?", (session_id,)
+            )
+            if cursor.fetchone() is None:
+                return False
+            
             self._conn.execute(
                 "DELETE FROM messages WHERE session_id = ?", (session_id,)
             )
@@ -910,6 +920,7 @@ class SessionDB:
                 (session_id,),
             )
             self._conn.commit()
+            return True
 
     def delete_session(self, session_id: str) -> bool:
         """Delete a session and all its messages. Returns True if found."""
