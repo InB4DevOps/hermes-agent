@@ -1646,8 +1646,9 @@ class AIAgent:
         # Prefill messages are injected at API-call time only (not in the messages
         # list), so no offset adjustment is needed here.
         i = 1
+        messages_len = len(messages)  # Cache length to avoid repeated len() calls
         
-        while i < len(messages):
+        while i < messages_len:
             msg = messages[i]
             
             if msg["role"] == "assistant":
@@ -1655,16 +1656,16 @@ class AIAgent:
                 if "tool_calls" in msg and msg["tool_calls"]:
                     # Format assistant message with tool calls
                     # Add <think> tags around reasoning for trajectory storage
-                    content = ""
+                    content_parts = []
                     
                     # Prepend reasoning in <think> tags if available (native thinking tokens)
                     if msg.get("reasoning") and msg["reasoning"].strip():
-                        content = f"<think>\n{msg['reasoning']}\n</think>\n"
+                        content_parts.append(f"<think>\n{msg['reasoning']}\n</think>\n")
                     
                     if msg.get("content") and msg["content"].strip():
                         # Convert any <REASONING_SCRATCHPAD> tags to <think> tags
                         # (used when native thinking is disabled and model reasons via XML)
-                        content += convert_scratchpad_to_think(msg["content"]) + "\n"
+                        content_parts.append(convert_scratchpad_to_think(msg["content"]) + "\n")
                     
                     # Add tool calls wrapped in XML tags
                     for tool_call in msg["tool_calls"]:
@@ -1683,7 +1684,10 @@ class AIAgent:
                             "name": tool_call["function"]["name"],
                             "arguments": arguments
                         }
-                        content += f"<tool_call>\n{json.dumps(tool_call_json, ensure_ascii=False)}\n</tool_call>\n"
+                        content_parts.append(f"<tool_call>\n{json.dumps(tool_call_json, ensure_ascii=False)}\n</tool_call>\n")
+                    
+                    # Join all parts efficiently instead of repeated string concatenation
+                    content = "".join(content_parts)
                     
                     # Ensure every gpt turn has a <think> block (empty if no reasoning)
                     # so the format is consistent for training data
@@ -1695,13 +1699,14 @@ class AIAgent:
                         "value": content.rstrip()
                     })
                     
-                    # Collect all subsequent tool responses
+                  # Collect all subsequent tool responses
                     tool_responses = []
                     j = i + 1
-                    while j < len(messages) and messages[j]["role"] == "tool":
+                    messages_len = len(messages)  # Cache for inner loop
+                    while j < messages_len and messages[j]["role"] == "tool":
                         tool_msg = messages[j]
                         # Format tool response with XML tags
-                        tool_response = f"<tool_response>\n"
+                        tool_response_parts = ["<tool_response>\n"]
                         
                         # Try to parse tool content as JSON if it looks like JSON
                         tool_content = tool_msg["content"]
@@ -1711,19 +1716,20 @@ class AIAgent:
                         except (json.JSONDecodeError, AttributeError):
                             pass  # Keep as string if not valid JSON
                         
-                        tool_index = len(tool_responses)
+                        # Use j - i - 1 as the tool index (simpler than len(tool_responses))
+                        tool_index = j - i - 1
                         tool_name = (
                             msg["tool_calls"][tool_index]["function"]["name"]
                             if tool_index < len(msg["tool_calls"])
                             else "unknown"
                         )
-                        tool_response += json.dumps({
+                        tool_response_parts.append(json.dumps({
                             "tool_call_id": tool_msg.get("tool_call_id", ""),
                             "name": tool_name,
                             "content": tool_content
-                        }, ensure_ascii=False)
-                        tool_response += "\n</tool_response>"
-                        tool_responses.append(tool_response)
+                        }, ensure_ascii=False))
+                        tool_response_parts.append("\n</think>")
+                        tool_responses.append("".join(tool_response_parts))
                         j += 1
                     
                     # Add all tool responses as a single message
@@ -1737,16 +1743,19 @@ class AIAgent:
                 else:
                     # Regular assistant message without tool calls
                     # Add <think> tags around reasoning for trajectory storage
-                    content = ""
+                    content_parts = []
                     
                     # Prepend reasoning in <think> tags if available (native thinking tokens)
                     if msg.get("reasoning") and msg["reasoning"].strip():
-                        content = f"<think>\n{msg['reasoning']}\n</think>\n"
+                        content_parts.append(f"<think>\n{msg['reasoning']}\n</think>\n")
                     
                     # Convert any <REASONING_SCRATCHPAD> tags to <think> tags
                     # (used when native thinking is disabled and model reasons via XML)
                     raw_content = msg["content"] or ""
-                    content += convert_scratchpad_to_think(raw_content)
+                    content_parts.append(convert_scratchpad_to_think(raw_content))
+                    
+                    # Join parts efficiently instead of repeated concatenation
+                    content = "".join(content_parts)
                     
                     # Ensure every gpt turn has a <think> block (empty if no reasoning)
                     if "<think>" not in content:
@@ -5597,7 +5606,7 @@ class AIAgent:
         interrupted = False
         codex_ack_continuations = 0
         length_continue_retries = 0
-        truncated_response_prefix = ""
+        truncated_response_parts = []  # Use list for efficient accumulation
         compression_attempts = 0
         
         # Clear any stale interrupt state at start
@@ -5949,7 +5958,7 @@ class AIAgent:
                                 interim_msg = self._build_assistant_message(assistant_message, finish_reason)
                                 messages.append(interim_msg)
                                 if assistant_message.content:
-                                    truncated_response_prefix += assistant_message.content
+                                    truncated_response_parts.append(assistant_message.content)
 
                                 if length_continue_retries < 3:
                                     self._vprint(
@@ -5970,7 +5979,7 @@ class AIAgent:
                                     restart_with_length_continuation = True
                                     break
 
-                                partial_response = self._strip_think_blocks(truncated_response_prefix).strip()
+                                partial_response = self._strip_think_blocks("".join(truncated_response_parts)).strip()
                                 self._cleanup_task_resources(effective_task_id)
                                 self._persist_session(messages, conversation_history)
                                 return {
@@ -7007,9 +7016,11 @@ class AIAgent:
 
                     codex_ack_continuations = 0
 
-                    if truncated_response_prefix:
-                        final_response = truncated_response_prefix + final_response
-                        truncated_response_prefix = ""
+                    # Prepend accumulated continuation text if any
+                    truncated_text = "".join(truncated_response_parts)
+                    if truncated_text:
+                        final_response = truncated_text + final_response
+                        truncated_response_parts = []
                         length_continue_retries = 0
                     
                     # Strip <think> blocks from user-facing response (keep raw in messages for trajectory)
