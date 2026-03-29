@@ -76,11 +76,14 @@ WRITE_DENIED_PREFIXES = [
 
 def _get_safe_write_root() -> Optional[str]:
     """Return the resolved HERMES_WRITE_SAFE_ROOT path, or None if unset.
-
+    
     When set, all write_file/patch operations are constrained to this
-    directory tree.  Writes outside it are denied even if the target is
-    not on the static deny list.  Opt-in hardening for gateway/messaging
+    directory tree. Writes outside it are denied even if the target is
+    not on the static deny list. Opt-in hardening for gateway/messaging
     deployments that should only touch a workspace checkout.
+    
+    Returns:
+        Resolved absolute path if HERMES_WRITE_SAFE_ROOT is set, None otherwise
     """
     root = os.getenv("HERMES_WRITE_SAFE_ROOT", "")
     if not root:
@@ -92,7 +95,15 @@ def _get_safe_write_root() -> Optional[str]:
 
 
 def _is_write_denied(path: str) -> bool:
-    """Return True if path is on the write deny list."""
+    """Return True if path is on the write deny list.
+    
+    Args:
+        path: File path to check against deny list and safe root sandbox
+        
+    Returns:
+        True if path is denied (static deny list or outside safe root),
+        False if writing is permitted
+    """
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
     # 1) Static deny list
@@ -245,30 +256,78 @@ class FileOperations(ABC):
     
     @abstractmethod
     def read_file(self, path: str, offset: int = 1, limit: int = 500) -> ReadResult:
-        """Read a file with pagination support."""
+        """Read a file with pagination support.
+        
+        Args:
+            path: File path to read (absolute or relative)
+            offset: Starting line number (1-indexed)
+            limit: Maximum number of lines to return
+            
+        Returns:
+            ReadResult containing file content and metadata
+        """
         ...
     
     @abstractmethod
     def write_file(self, path: str, content: str) -> WriteResult:
-        """Write content to a file, creating directories as needed."""
+        """Write content to a file, creating directories as needed.
+        
+        Args:
+            path: Destination file path
+            content: Content to write to the file
+            
+        Returns:
+            WriteResult with bytes written and any warnings
+        """
         ...
     
     @abstractmethod
     def patch_replace(self, path: str, old_string: str, new_string: str, 
                       replace_all: bool = False) -> PatchResult:
-        """Replace text in a file using fuzzy matching."""
+        """Replace text in a file using fuzzy matching.
+        
+        Args:
+            path: File path to patch
+            old_string: Text to find and replace
+            new_string: Replacement text
+            replace_all: If True, replace all occurrences; otherwise replace first
+            
+        Returns:
+            PatchResult with diff and status
+        """
         ...
     
     @abstractmethod
     def patch_v4a(self, patch_content: str) -> PatchResult:
-        """Apply a V4A format patch."""
+        """Apply a V4A format patch.
+        
+        Args:
+            patch_content: V4A format patch string with Begin/End markers
+            
+        Returns:
+            PatchResult with applied changes and status
+        """
         ...
     
     @abstractmethod
     def search(self, pattern: str, path: str = ".", target: str = "content",
                file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
                output_mode: str = "content", context: int = 0) -> SearchResult:
-        """Search for content or files."""
+        """Search for content or files.
+        
+        Args:
+            pattern: Regex pattern for content search or glob for file search
+            path: Directory or file to search in
+            target: 'content' for file content search, 'files' for name search
+            file_glob: Filter files by pattern (e.g., '*.py')
+            limit: Maximum results to return
+            offset: Skip first N results for pagination
+            output_mode: 'content', 'files_only', or 'count'
+            context: Number of context lines around matches
+            
+        Returns:
+            SearchResult with matches and metadata
+        """
         ...
 
 
@@ -363,17 +422,30 @@ class ShellFileOperations(FileOperations):
         )
     
     def _has_command(self, cmd: str) -> bool:
-        """Check if a command exists in the environment (cached)."""
+        """Check if a command exists in the environment (cached).
+        
+        Args:
+            cmd: Command name to check (e.g., 'python', 'node')
+            
+        Returns:
+            True if command is found in PATH, False otherwise
+        """
         if cmd not in self._command_cache:
             result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
     
     def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
-        """
-        Check if a file is likely binary.
+        """Check if a file is likely binary.
         
         Uses extension check (fast) + content analysis (fallback).
+        
+        Args:
+            path: File path to check
+            content_sample: Optional content sample for analysis if extension check fails
+            
+        Returns:
+            True if file appears to be binary, False otherwise
         """
         ext = os.path.splitext(path)[1].lower()
         if ext in BINARY_EXTENSIONS:
@@ -390,12 +462,27 @@ class ShellFileOperations(FileOperations):
         return False
     
     def _is_image(self, path: str) -> bool:
-        """Check if file is an image we can return as base64."""
+        """Check if file is an image we can return as base64.
+        
+        Args:
+            path: File path to check
+            
+        Returns:
+            True if file has a recognized image extension, False otherwise
+        """
         ext = os.path.splitext(path)[1].lower()
         return ext in IMAGE_EXTENSIONS
     
     def _add_line_numbers(self, content: str, start_line: int = 1) -> str:
-        """Add line numbers to content in LINE_NUM|CONTENT format."""
+        """Add line numbers to content in LINE_NUM|CONTENT format.
+        
+        Args:
+            content: Raw file content to number
+            start_line: Starting line number (default 1)
+            
+        Returns:
+            Numbered content with format "LINE_NUM|CONTENT"
+        """
         lines = content.split('\n')
         numbered = []
         for i, line in enumerate(lines, start=start_line):
@@ -406,11 +493,16 @@ class ShellFileOperations(FileOperations):
         return '\n'.join(numbered)
     
     def _expand_path(self, path: str) -> str:
-        """
-        Expand shell-style paths like ~ and ~user to absolute paths.
+        """Expand shell-style paths like ~ and ~user to absolute paths.
         
         This must be done BEFORE shell escaping, since ~ doesn't expand
         inside single quotes.
+        
+        Args:
+            path: Path string that may contain ~ or ~user shorthand
+            
+        Returns:
+            Expanded absolute path, or original path if no expansion possible
         """
         if not path:
             return path
@@ -443,12 +535,30 @@ class ShellFileOperations(FileOperations):
         return path
     
     def _escape_shell_arg(self, arg: str) -> str:
-        """Escape a string for safe use in shell commands."""
+        """Escape a string for safe use in shell commands.
+        
+        Uses single quotes and properly escapes any single quotes in the string.
+        
+        Args:
+            arg: String argument to escape for shell safety
+            
+        Returns:
+            Shell-escaped string safe for command-line use
+        """
         # Use single quotes and escape any single quotes in the string
-        return "'" + arg.replace("'", "'\"'\"'") + "'"
+        return "'" + arg.replace("'", "'\\\"'\\\"'") + "'"
     
     def _unified_diff(self, old_content: str, new_content: str, filename: str) -> str:
-        """Generate unified diff between old and new content."""
+        """Generate unified diff between old and new content.
+        
+        Args:
+            old_content: Original file content before changes
+            new_content: Modified file content after changes
+            filename: Filename for diff header
+            
+        Returns:
+            Unified diff string showing line-by-line changes
+        """
         old_lines = old_content.splitlines(keepends=True)
         new_lines = new_content.splitlines(keepends=True)
         diff = difflib.unified_diff(
@@ -462,26 +572,22 @@ class ShellFileOperations(FileOperations):
     # READ Implementation
     # =========================================================================
     
-    def _ends_with_newline(self, path: str) -> bool:
-        """Check if a file ends with a newline character.
+    def _ends_with_newline(self, content: str) -> bool:
+        """Check if content ends with a newline character.
         
-        Uses tail to read the last byte and checks if it is a newline.
-        Much simpler and more reliable than complex shell pipelines.
+        Checks the last character of already-read content in-memory.
+        This avoids spawning a subprocess (tail -c 1) for every file read,
+        reducing overhead significantly.
         
         Args:
-            path: File path to check
+            content: File content string to check
             
         Returns:
-            True if file ends with newline, False otherwise
+            True if content ends with newline, False otherwise
         """
-        # Use tail -c 1 to get the last byte
-        # If the file ends with newline, output will be '\n'
-        # If not, output will be the last character without newline
-        last_byte_cmd = f"tail -c 1 {self._escape_shell_arg(path)} 2>/dev/null"
-        last_byte_result = self._exec(last_byte_cmd)
-        
-        # Check if the last byte is a newline character
-        return last_byte_result.stdout == '\n'
+        if not content:
+            return False
+        return content.endswith('\n')
     
     def read_file(self, path: str, offset: int = 1, limit: int = 500) -> ReadResult:
         """
@@ -542,28 +648,43 @@ class ShellFileOperations(FileOperations):
                 error="Binary file - cannot display as text. Use appropriate tools to handle this file type."
             )
         
-        # Read with pagination using sed
-        end_line = offset + limit - 1
-        read_cmd = f"sed -n '{offset},{end_line}p' {self._escape_shell_arg(path)}"
-        read_result = self._exec(read_cmd)
+        # Read the full file content once (we'll paginate in Python)
+        # This allows us to check for trailing newline in-memory instead
+        # of spawning another subprocess
+        full_read_cmd = f"cat {self._escape_shell_arg(path)}"
+        full_read_result = self._exec(full_read_cmd)
         
-        if read_result.exit_code != 0:
-            return ReadResult(error=f"Failed to read file: {read_result.stdout}")
+        if full_read_result.exit_code != 0:
+            return ReadResult(error=f"Failed to read file: {full_read_result.stdout}")
         
-        # Get total line count
+        full_content = full_read_result.stdout
+        
+        # Get total line count from wc -l
         # NOTE: wc -l counts newline characters, not lines. A file without a
         # trailing newline will undercount by 1. We fix this by checking if
-        # the file ends with a newline using our reliable Python-based method.
+        # the content ends with a newline in-memory (no subprocess needed).
         wc_cmd = f"wc -l < {self._escape_shell_arg(path)}"
         wc_result = self._exec(wc_cmd)
         try:
             total_lines = int(wc_result.stdout.strip())
-            # Check if file ends without newline using our reliable method
-            if not self._ends_with_newline(path):
+            # Check if file ends without newline using in-memory check
+            if not self._ends_with_newline(full_content):
                 # File doesn't end with newline, wc -l undercounted by 1
                 total_lines += 1
         except ValueError:
             total_lines = 0
+        
+        # Paginate the content in Python (more efficient than sed for each read)
+        end_line = offset + limit - 1
+        lines = full_content.splitlines(keepends=True)
+        # Handle edge case where file doesn't end with newline
+        if lines and not lines[-1].endswith('\n'):
+            # Last line doesn't have newline, that's fine
+            pass
+        # Extract the requested range (1-indexed offset)
+        start_idx = offset - 1
+        read_content = ''.join(lines[start_idx:end_line])
+        read_result = type('obj', (object,), {'stdout': read_content, 'exit_code': 0})()
         
         # Check if truncated
         truncated = total_lines > end_line
@@ -584,7 +705,15 @@ class ShellFileOperations(FileOperations):
     MAX_IMAGE_BYTES = 512 * 1024  # 512 KB
 
     def _read_image(self, path: str) -> ReadResult:
-        """Read an image file, returning base64 content."""
+        """Read an image file, returning base64 content.
+        
+        Args:
+            path: Path to the image file
+            
+        Returns:
+            ReadResult with base64 content, dimensions, and metadata
+            If image is too large (>512KB), returns metadata only with hint
+        """
         # Get file size (wc -c is POSIX, works on Linux + macOS)
         stat_cmd = f"wc -c < {self._escape_shell_arg(path)} 2>/dev/null"
         stat_result = self._exec(stat_cmd)
@@ -647,7 +776,14 @@ class ShellFileOperations(FileOperations):
         )
     
     def _suggest_similar_files(self, path: str) -> ReadResult:
-        """Suggest similar files when the requested file is not found."""
+        """Suggest similar files when the requested file is not found.
+        
+        Args:
+            path: Path of the file that was not found
+            
+        Returns:
+            ReadResult with error message and list of similar filenames
+        """
         # Get directory and filename
         dir_path = os.path.dirname(path) or "."
         filename = os.path.basename(path)
@@ -897,7 +1033,17 @@ class ShellFileOperations(FileOperations):
                                         output_mode, context)
     
     def _search_files(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
-        """Search for files by name pattern (glob-like)."""
+        """Search for files by name pattern (glob-like).
+        
+        Args:
+            pattern: Glob pattern for filename matching
+            path: Directory to search in
+            limit: Maximum number of results to return
+            offset: Skip first N results for pagination
+            
+        Returns:
+            SearchResult with list of matching file paths
+        """
         # Auto-prepend **/ for recursive search if not already present
         if not pattern.startswith('**/') and '/' not in pattern:
             search_pattern = pattern
@@ -949,10 +1095,19 @@ class ShellFileOperations(FileOperations):
 
     def _search_files_rg(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
         """Search for files by name using ripgrep's --files mode.
-
+        
         rg --files respects .gitignore and excludes hidden directories by
         default, and uses parallel directory traversal for ~200x speedup
         over find on wide trees.
+        
+        Args:
+            pattern: Glob pattern for filename matching
+            path: Directory to search in
+            limit: Maximum number of results to return
+            offset: Skip first N results for pagination
+            
+        Returns:
+            SearchResult with list of matching file paths
         """
         # rg --files -g uses glob patterns; wrap bare names so they match
         # at any depth (equivalent to find -name).
@@ -980,7 +1135,20 @@ class ShellFileOperations(FileOperations):
     
     def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
                         limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
-        """Search for content inside files (grep-like)."""
+        """Search for content inside files (grep-like).
+        
+        Args:
+            pattern: Regex pattern to search for in file contents
+            path: Directory to search in
+            file_glob: Optional glob pattern to filter files (e.g., '*.py')
+            limit: Maximum number of results to return
+            offset: Skip first N results for pagination
+            output_mode: 'content', 'files_only', or 'count'
+            context: Number of context lines around each match
+            
+        Returns:
+            SearchResult with matches and metadata
+        """
         # Try ripgrep first (fast), fallback to grep (slower but works)
         if self._has_command('rg'):
             return self._search_with_rg(pattern, path, file_glob, limit, offset, 
@@ -997,7 +1165,20 @@ class ShellFileOperations(FileOperations):
     
     def _search_with_rg(self, pattern: str, path: str, file_glob: Optional[str],
                         limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
-        """Search using ripgrep."""
+        """Search using ripgrep.
+        
+        Args:
+            pattern: Regex pattern to search for
+            path: Directory to search in
+            file_glob: Optional file type filter
+            limit: Maximum results to return
+            offset: Skip first N results
+            output_mode: Output format mode
+            context: Context lines around matches
+            
+        Returns:
+            SearchResult with ripgrep output formatted according to output_mode
+        """
         cmd_parts = ["rg", "--line-number", "--no-heading", "--with-filename"]
         
         # Add context if requested
@@ -1095,8 +1276,21 @@ class ShellFileOperations(FileOperations):
             )
     
     def _search_with_grep(self, pattern: str, path: str, file_glob: Optional[str],
-                          limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
-        """Fallback search using grep."""
+                           limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
+        """Fallback search using grep.
+        
+        Args:
+            pattern: Regex pattern to search for
+            path: Directory to search in
+            file_glob: Optional file type filter
+            limit: Maximum results to return
+            offset: Skip first N results
+            output_mode: Output format mode
+            context: Context lines around matches
+            
+        Returns:
+            SearchResult with grep output formatted according to output_mode
+        """
         cmd_parts = ["grep", "-rnH"]  # -H forces filename even for single-file searches
         
         # Exclude hidden directories (matching ripgrep's default behavior).

@@ -1,29 +1,28 @@
 """Tests for tools/read_tracker.py - Consecutive read/search loop detection."""
 
-import os
 import pytest
 import threading
+import sys
+from pathlib import Path
+
+# Import read_tracker directly without triggering tools/__init__.py
+# This avoids importing optional dependencies like firecrawl
+_project_root = Path(__file__).parent.parent.parent
+
+# Load the module directly
 import importlib.util
+_read_tracker_path = _project_root / "tools" / "read_tracker.py"
+_read_tracker_spec = importlib.util.spec_from_file_location("read_tracker", _read_tracker_path)
+_read_tracker_module = importlib.util.module_from_spec(_read_tracker_spec)
+_read_tracker_spec.loader.exec_module(_read_tracker_module)
 
-# Load read_tracker directly to avoid circular imports through tools/__init__.py
-# test_read_tracker.py is in tests/tools/, read_tracker.py is in tools/
-# So we need: tests/tools/ -> tests/ -> .. -> tools/
-_tools_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "tools")
-_tools_dir = os.path.abspath(_tools_dir)
-_read_tracker_spec = importlib.util.spec_from_file_location(
-    "read_tracker",
-    os.path.join(_tools_dir, "read_tracker.py")
-)
-read_tracker_module = importlib.util.module_from_spec(_read_tracker_spec)
-_read_tracker_spec.loader.exec_module(read_tracker_module)
-
-ReadTracker = read_tracker_module.ReadTracker
-CheckResult = read_tracker_module.CheckResult
-DEFAULT_BLOCK_THRESHOLD = read_tracker_module.DEFAULT_BLOCK_THRESHOLD
-DEFAULT_WARN_THRESHOLD = read_tracker_module.DEFAULT_WARN_THRESHOLD
-INVESTIGATION_BLOCK_THRESHOLD = read_tracker_module.INVESTIGATION_BLOCK_THRESHOLD
-INVESTIGATION_WARN_THRESHOLD = read_tracker_module.INVESTIGATION_WARN_THRESHOLD
-get_tracker = read_tracker_module.get_tracker
+ReadTracker = _read_tracker_module.ReadTracker
+CheckResult = _read_tracker_module.CheckResult
+DEFAULT_BLOCK_THRESHOLD = _read_tracker_module.DEFAULT_BLOCK_THRESHOLD
+DEFAULT_WARN_THRESHOLD = _read_tracker_module.DEFAULT_WARN_THRESHOLD
+INVESTIGATION_BLOCK_THRESHOLD = _read_tracker_module.INVESTIGATION_BLOCK_THRESHOLD
+INVESTIGATION_WARN_THRESHOLD = _read_tracker_module.INVESTIGATION_WARN_THRESHOLD
+get_tracker = _read_tracker_module.get_tracker
 
 
 # ============================================================================

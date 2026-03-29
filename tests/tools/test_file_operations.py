@@ -333,3 +333,397 @@ class TestShellFileOpsWriteDenied:
         result = file_ops.patch_replace("~/.ssh/authorized_keys", "old", "new")
         assert result.error is not None
         assert "denied" in result.error.lower()
+
+
+# =========================================================================
+# read_file line counting fix (wc -l undercounting)
+# =========================================================================
+
+class TestReadFileLineCounting:
+    """Test that read_file correctly counts lines for files with/without trailing newlines.
+    
+    Regression test for the wc -l bug where files without trailing newlines
+    were undercounted by 1, causing incorrect truncation detection.
+    """
+
+    @pytest.fixture()
+    def file_ops_with_real_exec(self, tmp_path):
+        """Create ShellFileOperations that actually executes shell commands."""
+        class RealExecMock:
+            """Mock that executes real shell commands for testing."""
+            def __init__(self, cwd):
+                self.cwd = cwd
+            
+            def execute(self, command, cwd=None):
+                import subprocess
+                result = subprocess.run(
+                    command, shell=True, capture_output=True, text=True,
+                    cwd=cwd or self.cwd
+                )
+                return {
+                    "output": result.stdout,
+                    "stderr": result.stderr,
+                    "exit_code": result.returncode,
+                    "returncode": result.returncode
+                }
+        
+        return ShellFileOperations(RealExecMock(str(tmp_path)))
+
+    def _create_test_file(self, tmp_path, lines, trailing_newline=True):
+        """Helper to create a test file with specified line count."""
+        content = "\n".join([f"Line {i}" for i in range(1, lines + 1)])
+        if trailing_newline:
+            content += "\n"
+        filepath = tmp_path / "test_file.txt"
+        filepath.write_text(content)
+        return str(filepath)
+
+    def test_read_file_with_trailing_newline(self, tmp_path, file_ops_with_real_exec):
+        """File with trailing newline should report correct line count."""
+        filepath = self._create_test_file(tmp_path, 10, trailing_newline=True)
+        result = file_ops_with_real_exec.read_file(filepath, offset=1, limit=5)
+        
+        assert result.total_lines == 10
+        assert result.truncated is True  # Lines 1-5 of 10, more available
+        assert result.error is None
+
+    def test_read_file_without_trailing_newline(self, tmp_path, file_ops_with_real_exec):
+        """File without trailing newline should report correct line count (not undercount)."""
+        filepath = self._create_test_file(tmp_path, 10, trailing_newline=False)
+        result = file_ops_with_real_exec.read_file(filepath, offset=1, limit=5)
+        
+        # This was the bug: wc -l reported 9 instead of 10
+        assert result.total_lines == 10, f"Expected 10 lines, got {result.total_lines}"
+        assert result.truncated is True  # Lines 1-5 of 10, more available
+        assert result.error is None
+
+    def test_read_file_without_newline_end_of_file(self, tmp_path, file_ops_with_real_exec):
+        """Reading end of file without trailing newline should not report truncated."""
+        filepath = self._create_test_file(tmp_path, 10, trailing_newline=False)
+        # Request lines 6-10 (the last 5 lines)
+        result = file_ops_with_real_exec.read_file(filepath, offset=6, limit=5)
+        
+        assert result.total_lines == 10
+        assert result.truncated is False  # No more lines available
+        assert result.error is None
+
+    def test_read_file_501_lines_without_newline(self, tmp_path, file_ops_with_real_exec):
+        """Large file without trailing newline should report correct count."""
+        filepath = self._create_test_file(tmp_path, 501, trailing_newline=False)
+        result = file_ops_with_real_exec.read_file(filepath, offset=1, limit=500)
+        
+        assert result.total_lines == 501, f"Expected 501 lines, got {result.total_lines}"
+        assert result.truncated is True  # Lines 1-500 of 501, more available
+        assert result.error is None
+
+    def test_read_file_single_line_without_newline(self, tmp_path, file_ops_with_real_exec):
+        """Single line file without newline should report 1 line (not 0)."""
+        filepath = self._create_test_file(tmp_path, 1, trailing_newline=False)
+        result = file_ops_with_real_exec.read_file(filepath, offset=1, limit=1)
+        
+        # This was the edge case: wc -l reported 0 for single line without newline
+        assert result.total_lines == 1, f"Expected 1 line, got {result.total_lines}"
+        assert result.truncated is False  # Only 1 line exists
+        assert result.error is None
+
+    def test_read_file_pagination_across_boundary(self, tmp_path, file_ops_with_real_exec):
+        """Reading exactly at the boundary of a file without trailing newline."""
+        filepath = self._create_test_file(tmp_path, 501, trailing_newline=False)
+        # Request lines 500-501
+        result = file_ops_with_real_exec.read_file(filepath, offset=500, limit=2)
+        
+        assert result.total_lines == 501
+        assert result.truncated is False  # Lines 500-501 are the last lines
+        assert result.error is None
+        # Should have content for both lines
+        assert "500|Line 500" in result.content
+        assert "501|Line 501" in result.content
+
+    def test_off_by_one_bug_regression(self, tmp_path, file_ops_with_real_exec):
+        """Regression test for the original off-by-one bug.
+        
+        This test demonstrates that the old implementation (using only wc -l)
+        would have undercounted lines for files without trailing newlines.
+        
+        The bug: wc -l counts newline characters, not lines. A file with
+        content "Line 1\nLine 2\nLine 3" (no trailing newline) has 3 lines
+        but only 2 newline characters, so wc -l returns 2.
+        
+        The fix: Check if the file ends with a newline using _ends_with_newline(),
+        and add 1 to the wc -l count if it doesn't.
+        """
+        # Create a file without trailing newline
+        filepath = self._create_test_file(tmp_path, 10, trailing_newline=False)
+        
+        # Verify the file actually doesn't end with newline
+        raw_content = Path(filepath).read_text()
+        assert not raw_content.endswith("\n"), "Test file should not end with newline"
+        
+        # Verify wc -l would undercount (simulate old behavior)
+        import subprocess
+        wc_result = subprocess.run(
+            f"wc -l < {filepath}", shell=True, capture_output=True, text=True
+        )
+        wc_count = int(wc_result.stdout.strip())
+        assert wc_count == 9, f"wc -l should report 9 (one less than actual lines), got {wc_count}"
+        
+        # Verify the new implementation returns the correct count
+        result = file_ops_with_real_exec.read_file(filepath, offset=1, limit=5)
+        assert result.total_lines == 10, f"Expected 10 lines (with fix), got {result.total_lines}"
+        assert result.error is None
+        
+        # Verify truncated flag is correct (lines 1-5 of 10)
+        assert result.truncated is True, "Should be truncated (5 of 10 lines read)"
+        
+        # Verify we can read the last line correctly
+        last_chunk = file_ops_with_real_exec.read_file(filepath, offset=10, limit=1)
+        assert last_chunk.total_lines == 10
+        assert last_chunk.truncated is False, "Should not be truncated when reading last line"
+        assert "10|Line 10" in last_chunk.content, "Should contain the last line"
+
+
+# =========================================================================
+# _ends_with_newline helper tests (Task 6)
+# =========================================================================
+
+class TestEndsWithNewline:
+    """Test the _ends_with_newline helper for various edge cases."""
+
+    @pytest.fixture()
+    def file_ops_with_real_exec(self, tmp_path):
+        """Create ShellFileOperations that actually executes shell commands."""
+        class RealExecMock:
+            """Mock that executes real shell commands for testing."""
+            def __init__(self, cwd):
+                self.cwd = cwd
+            
+            def execute(self, command, cwd=None):
+                import subprocess
+                result = subprocess.run(
+                    command, shell=True, capture_output=True,
+                    cwd=cwd or self.cwd  # Note: no text=True for binary safety
+                )
+                # Decode stdout, handling binary data
+                try:
+                    stdout = result.stdout.decode('utf-8', errors='replace')
+                except Exception:
+                    stdout = result.stdout.decode('latin-1')  # Fallback
+                return {
+                    "output": stdout,
+                    "stderr": result.stderr.decode('utf-8', errors='replace') if result.stderr else "",
+                    "exit_code": result.returncode,
+                    "returncode": result.returncode
+                }
+        
+        return ShellFileOperations(RealExecMock(str(tmp_path)))
+
+    def test_empty_file(self, tmp_path, file_ops_with_real_exec):
+        """Empty file should return False (no newline)."""
+        filepath = tmp_path / "empty.txt"
+        filepath.write_text("")
+        result = file_ops_with_real_exec._ends_with_newline(str(filepath))
+        assert result is False, "Empty file does not end with newline"
+
+    def test_file_ending_with_newline(self, tmp_path, file_ops_with_real_exec):
+        """File ending with newline should return True."""
+        filepath = tmp_path / "with_newline.txt"
+        filepath.write_text("Line 1\nLine 2\nLine 3\n")
+        result = file_ops_with_real_exec._ends_with_newline(str(filepath))
+        assert result is True, "File ending with \\n should return True"
+
+    def test_file_not_ending_with_newline(self, tmp_path, file_ops_with_real_exec):
+        """File not ending with newline should return False."""
+        filepath = tmp_path / "no_newline.txt"
+        filepath.write_text("Line 1\nLine 2\nLine 3")
+        result = file_ops_with_real_exec._ends_with_newline(str(filepath))
+        assert result is False, "File not ending with \\n should return False"
+
+    def test_single_character_with_newline(self, tmp_path, file_ops_with_real_exec):
+        """Single character file with newline should return True."""
+        filepath = tmp_path / "single_with_nl.txt"
+        filepath.write_text("a\n")
+        result = file_ops_with_real_exec._ends_with_newline(str(filepath))
+        assert result is True, "Single char with \\n should return True"
+
+    def test_single_character_without_newline(self, tmp_path, file_ops_with_real_exec):
+        """Single character file without newline should return False."""
+        filepath = tmp_path / "single_no_nl.txt"
+        filepath.write_text("a")
+        result = file_ops_with_real_exec._ends_with_newline(str(filepath))
+        assert result is False, "Single char without \\n should return False"
+
+    def test_only_newline(self, tmp_path, file_ops_with_real_exec):
+        """File containing only a newline should return True."""
+        filepath = tmp_path / "only_newline.txt"
+        filepath.write_text("\n")
+        result = file_ops_with_real_exec._ends_with_newline(str(filepath))
+        assert result is True, "File with only \\n should return True"
+
+    def test_path_with_spaces(self, tmp_path, file_ops_with_real_exec):
+        """File with spaces in path should be handled correctly."""
+        # Create a subdirectory with spaces
+        subdir = tmp_path / "dir with spaces"
+        subdir.mkdir()
+        filepath = subdir / "file with spaces.txt"
+        filepath.write_text("content\n")
+        result = file_ops_with_real_exec._ends_with_newline(str(filepath))
+        assert result is True, "File with spaces in path ending with \\n should return True"
+
+    def test_path_with_special_characters(self, tmp_path, file_ops_with_real_exec):
+        """File with special characters in path should be handled correctly."""
+        # Create a subdirectory with special characters
+        subdir = tmp_path / "dir-special!@#"
+        subdir.mkdir()
+        filepath = subdir / "file@special.txt"
+        filepath.write_text("content")
+        result = file_ops_with_real_exec._ends_with_newline(str(filepath))
+        assert result is False, "File with special chars in path not ending with \\n should return False"
+
+    def test_multiline_file_with_newline(self, tmp_path, file_ops_with_real_exec):
+        """Multi-line file ending with newline should return True."""
+        filepath = tmp_path / "multiline.txt"
+        filepath.write_text("\n".join([f"Line {i}" for i in range(1, 101)]) + "\n")
+        result = file_ops_with_real_exec._ends_with_newline(str(filepath))
+        assert result is True, "100-line file ending with \\n should return True"
+
+    def test_multiline_file_without_newline(self, tmp_path, file_ops_with_real_exec):
+        """Multi-line file not ending with newline should return False."""
+        filepath = tmp_path / "multiline_no_nl.txt"
+        filepath.write_text("\n".join([f"Line {i}" for i in range(1, 101)]))
+        result = file_ops_with_real_exec._ends_with_newline(str(filepath))
+        assert result is False, "100-line file not ending with \\n should return False"
+
+    def test_binary_like_content_with_newline(self, tmp_path, file_ops_with_real_exec):
+        """File with binary-like content ending with newline."""
+        filepath = tmp_path / "binary_like.bin"
+        filepath.write_bytes(b"\x00\x01\x02\x03\n")
+        result = file_ops_with_real_exec._ends_with_newline(str(filepath))
+        assert result is True, "Binary file ending with \\n should return True"
+
+    def test_unicode_content_with_newline(self, tmp_path, file_ops_with_real_exec):
+        """File with unicode content ending with newline."""
+        filepath = tmp_path / "unicode.txt"
+        filepath.write_text("Hello 世界！\n🎉🚀\n")
+        result = file_ops_with_real_exec._ends_with_newline(str(filepath))
+        assert result is True, "Unicode file ending with \\n should return True"
+
+    def test_unicode_content_without_newline(self, tmp_path, file_ops_with_real_exec):
+        """File with unicode content not ending with newline."""
+        filepath = tmp_path / "unicode_no_nl.txt"
+        filepath.write_text("Hello 世界！\n🎉🚀")
+        result = file_ops_with_real_exec._ends_with_newline(str(filepath))
+        assert result is False, "Unicode file not ending with \\n should return False"
+
+
+# =========================================================================
+# Threshold constants and investigation mode tests (Tasks 4 & 5)
+# =========================================================================
+
+class TestThresholdConstants:
+    """Test threshold constants and their environment variable overrides."""
+
+    def test_default_block_threshold(self):
+        """Default block threshold should be 4."""
+        from tools.file_tools import DEFAULT_BLOCK_THRESHOLD
+        assert DEFAULT_BLOCK_THRESHOLD == 4
+
+    def test_default_warn_threshold(self):
+        """Default warn threshold should be 3."""
+        from tools.file_tools import DEFAULT_WARN_THRESHOLD
+        assert DEFAULT_WARN_THRESHOLD == 3
+
+    def test_investigation_block_threshold(self):
+        """Investigation mode block threshold should be 2."""
+        from tools.file_tools import INVESTIGATION_BLOCK_THRESHOLD
+        assert INVESTIGATION_BLOCK_THRESHOLD == 2
+
+    def test_investigation_warn_threshold(self):
+        """Investigation mode warn threshold should be 2."""
+        from tools.file_tools import INVESTIGATION_WARN_THRESHOLD
+        assert INVESTIGATION_WARN_THRESHOLD == 2
+
+
+class TestInvestigationMode:
+    """Test per-session investigation mode functionality."""
+
+    def test_set_investigation_mode_enabled(self):
+        """Setting investigation mode should enable it for the task."""
+        from tools.file_tools import set_investigation_mode, get_investigation_mode, clear_read_tracker
+        
+        task_id = "test_task_enabled"
+        set_investigation_mode(task_id, enabled=True)
+        assert get_investigation_mode(task_id) is True
+        
+        clear_read_tracker(task_id)
+
+    def test_set_investigation_mode_disabled(self):
+        """Disabling investigation mode should set it to False."""
+        from tools.file_tools import set_investigation_mode, get_investigation_mode, clear_read_tracker
+        
+        task_id = "test_task_disabled"
+        set_investigation_mode(task_id, enabled=False)
+        assert get_investigation_mode(task_id) is False
+        
+        clear_read_tracker(task_id)
+
+    def test_get_investigation_mode_default(self):
+        """Getting investigation mode for non-existent task should return False."""
+        from tools.file_tools import get_investigation_mode
+        
+        task_id = "non_existent_task_12345"
+        assert get_investigation_mode(task_id) is False
+
+    def test_investigation_mode_per_session_isolation(self):
+        """Investigation mode should be isolated per task_id."""
+        from tools.file_tools import set_investigation_mode, get_investigation_mode, clear_read_tracker
+        
+        task_id_1 = "session_one"
+        task_id_2 = "session_two"
+        
+        set_investigation_mode(task_id_1, enabled=True)
+        set_investigation_mode(task_id_2, enabled=False)
+        
+        assert get_investigation_mode(task_id_1) is True
+        assert get_investigation_mode(task_id_2) is False
+        
+        clear_read_tracker(task_id_1)
+        clear_read_tracker(task_id_2)
+
+    def test_investigation_mode_toggle(self):
+        """Investigation mode should be toggleable."""
+        from tools.file_tools import set_investigation_mode, get_investigation_mode, clear_read_tracker
+        
+        task_id = "toggle_test"
+        
+        set_investigation_mode(task_id, enabled=True)
+        assert get_investigation_mode(task_id) is True
+        
+        set_investigation_mode(task_id, enabled=False)
+        assert get_investigation_mode(task_id) is False
+        
+        set_investigation_mode(task_id, enabled=True)
+        assert get_investigation_mode(task_id) is True
+        
+        clear_read_tracker(task_id)
+
+    def test_investigation_mode_initializes_tracker(self):
+        """Setting investigation mode should initialize the tracker entry."""
+        from tools.file_tools import set_investigation_mode, _read_tracker, _read_tracker_lock, clear_read_tracker
+        
+        task_id = "init_tracker_test"
+        
+        # Ensure task doesn't exist yet
+        with _read_tracker_lock:
+            assert task_id not in _read_tracker
+        
+        set_investigation_mode(task_id, enabled=True)
+        
+        # Now it should exist with proper structure
+        with _read_tracker_lock:
+            assert task_id in _read_tracker
+            assert _read_tracker[task_id]["investigation_mode"] is True
+            assert _read_tracker[task_id]["last_key"] is None
+            assert _read_tracker[task_id]["consecutive"] == 0
+            assert isinstance(_read_tracker[task_id]["read_history"], set)
+        
+        clear_read_tracker(task_id)

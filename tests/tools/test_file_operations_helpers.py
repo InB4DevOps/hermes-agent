@@ -5,22 +5,26 @@ Tests for:
 - _escape_shell_arg() for safe shell escaping (Task 9)
 """
 
-import os
 import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+import sys
+
+# Import file_operations directly without triggering tools/__init__.py
+# This avoids importing optional dependencies like firecrawl
+_sys_path = sys.path.copy()
+_project_root = Path(__file__).parent.parent.parent
+if str(_project_root) not in _sys_path:
+    _sys_path.insert(0, str(_project_root))
+
+# Load the module directly
 import importlib.util
+_file_ops_path = _project_root / "tools" / "file_operations.py"
+_file_ops_spec = importlib.util.spec_from_file_location("file_operations", _file_ops_path)
+_file_ops_module = importlib.util.module_from_spec(_file_ops_spec)
+_file_ops_spec.loader.exec_module(_file_ops_module)
 
-# Load file_operations directly to avoid circular imports through tools/__init__.py
-_tools_dir = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "..", "tools"))
-_file_ops_spec = importlib.util.spec_from_file_location(
-    "file_operations",
-    os.path.join(_tools_dir, "file_operations.py")
-)
-file_operations_module = importlib.util.module_from_spec(_file_ops_spec)
-_file_ops_spec.loader.exec_module(file_operations_module)
-
-ShellFileOperations = file_operations_module.ShellFileOperations
+ShellFileOperations = _file_ops_module.ShellFileOperations
 
 
 # ============================================================================
@@ -28,136 +32,92 @@ ShellFileOperations = file_operations_module.ShellFileOperations
 # ============================================================================
 
 class TestEndsWithNewline:
-    """Comprehensive tests for the _ends_with_newline helper method."""
+    """Comprehensive tests for the _ends_with_newline helper method.
+    
+    Note: The optimized version checks content in-memory rather than
+    spawning a subprocess, so tests pass content strings directly.
+    """
     
     def setup_method(self):
         """Create a mock terminal environment for each test."""
         self.mock_env = MagicMock()
         self.file_ops = ShellFileOperations(self.mock_env, cwd="/test")
     
-    def test_empty_file(self, tmp_path):
-        """Empty file should return False (no newline)."""
-        file_path = tmp_path / "empty.txt"
-        file_path.write_bytes(b"")
-        
-        self.mock_env.execute.return_value = {"output": "", "returncode": 0}
-        result = self.file_ops._ends_with_newline(str(file_path))
+    def test_empty_content(self):
+        """Empty content should return False (no newline)."""
+        result = self.file_ops._ends_with_newline("")
         assert result is False
     
-    def test_file_ending_with_newline(self, tmp_path):
-        """File ending with newline should return True."""
-        file_path = tmp_path / "with_newline.txt"
-        file_path.write_text("hello world\n")
-        
-        self.mock_env.execute.return_value = {"output": "\n", "returncode": 0}
-        result = self.file_ops._ends_with_newline(str(file_path))
+    def test_content_ending_with_newline(self):
+        """Content ending with newline should return True."""
+        result = self.file_ops._ends_with_newline("hello world\n")
         assert result is True
     
-    def test_file_not_ending_with_newline(self, tmp_path):
-        """File not ending with newline should return False."""
-        file_path = tmp_path / "no_newline.txt"
-        file_path.write_bytes(b"hello world")
-        
-        self.mock_env.execute.return_value = {"output": "d", "returncode": 0}
-        result = self.file_ops._ends_with_newline(str(file_path))
+    def test_content_not_ending_with_newline(self):
+        """Content not ending with newline should return False."""
+        result = self.file_ops._ends_with_newline("hello world")
         assert result is False
     
-    def test_path_with_spaces(self, tmp_path):
-        """Path containing spaces should be handled correctly."""
-        dir_with_spaces = tmp_path / "dir with spaces"
-        dir_with_spaces.mkdir()
-        file_path = dir_with_spaces / "file with spaces.txt"
-        file_path.write_text("content\n")
-        
-        self.mock_env.execute.return_value = {"output": "\n", "returncode": 0}
-        result = self.file_ops._ends_with_newline(str(file_path))
+    def test_single_newline(self):
+        """Single newline character should return True."""
+        result = self.file_ops._ends_with_newline("\n")
         assert result is True
     
-    def test_path_with_special_characters(self, tmp_path):
-        """Path with special characters should be properly escaped."""
-        dir_special = tmp_path / "dir-special!@#"
-        dir_special.mkdir()
-        file_path = dir_special / "file@special.txt"
-        file_path.write_text("content\n")
-        
-        self.mock_env.execute.return_value = {"output": "\n", "returncode": 0}
-        result = self.file_ops._ends_with_newline(str(file_path))
-        assert result is True
-    
-    def test_unicode_content(self, tmp_path):
-        """File with unicode content ending with newline."""
-        file_path = tmp_path / "unicode.txt"
-        file_path.write_text("こんにちは世界\n")
-        
-        self.mock_env.execute.return_value = {"output": "\n", "returncode": 0}
-        result = self.file_ops._ends_with_newline(str(file_path))
-        assert result is True
-    
-    def test_binary_like_content(self, tmp_path):
-        """File with binary-like content."""
-        file_path = tmp_path / "binary.bin"
-        file_path.write_bytes(b"\x00\x01\x02\x03\n")
-        
-        self.mock_env.execute.return_value = {"output": "\n", "returncode": 0}
-        result = self.file_ops._ends_with_newline(str(file_path))
-        assert result is True
-    
-    def test_single_character_file_with_newline(self, tmp_path):
-        """Single character file containing just a newline."""
-        file_path = tmp_path / "single_nl.txt"
-        file_path.write_bytes(b"\n")
-        
-        self.mock_env.execute.return_value = {"output": "\n", "returncode": 0}
-        result = self.file_ops._ends_with_newline(str(file_path))
-        assert result is True
-    
-    def test_single_character_file_without_newline(self, tmp_path):
-        """Single character file without newline."""
-        file_path = tmp_path / "single_char.txt"
-        file_path.write_bytes(b"x")
-        
-        self.mock_env.execute.return_value = {"output": "x", "returncode": 0}
-        result = self.file_ops._ends_with_newline(str(file_path))
+    def test_single_character_no_newline(self):
+        """Single character without newline should return False."""
+        result = self.file_ops._ends_with_newline("x")
         assert result is False
     
-    def test_multiline_file_ending_with_newline(self, tmp_path):
-        """Multi-line file ending with newline."""
-        file_path = tmp_path / "multiline.txt"
-        file_path.write_text("line1\nline2\nline3\n")
-        
-        self.mock_env.execute.return_value = {"output": "\n", "returncode": 0}
-        result = self.file_ops._ends_with_newline(str(file_path))
+    def test_multiline_ending_with_newline(self):
+        """Multiline content ending with newline should return True."""
+        content = "line1\nline2\nline3\n"
+        result = self.file_ops._ends_with_newline(content)
         assert result is True
     
-    def test_multiline_file_not_ending_with_newline(self, tmp_path):
-        """Multi-line file not ending with newline."""
-        file_path = tmp_path / "multiline_no_nl.txt"
-        file_path.write_text("line1\nline2\nline3")
-        
-        self.mock_env.execute.return_value = {"output": "3", "returncode": 0}
-        result = self.file_ops._ends_with_newline(str(file_path))
+    def test_multiline_not_ending_with_newline(self):
+        """Multiline content not ending with newline should return False."""
+        content = "line1\nline2\nline3"
+        result = self.file_ops._ends_with_newline(content)
         assert result is False
     
-    def test_file_not_found(self, tmp_path):
-        """Non-existent file should return False."""
-        file_path = tmp_path / "nonexistent.txt"
-        
-        self.mock_env.execute.return_value = {"output": "", "returncode": 1}
-        result = self.file_ops._ends_with_newline(str(file_path))
-        assert result is False
-    
-    def test_only_newline_in_file(self, tmp_path):
-        """File containing only a newline character."""
-        file_path = tmp_path / "only_newline.txt"
-        file_path.write_bytes(b"\n")
-        
-        self.mock_env.execute.return_value = {"output": "\n", "returncode": 0}
-        result = self.file_ops._ends_with_newline(str(file_path))
+    def test_only_newlines(self):
+        """Content with only newlines should return True."""
+        result = self.file_ops._ends_with_newline("\n\n\n")
         assert result is True
+    
+    def test_unicode_content_with_newline(self):
+        """Unicode content ending with newline should return True."""
+        result = self.file_ops._ends_with_newline("hello 世界\n")
+        assert result is True
+    
+    def test_unicode_content_without_newline(self):
+        """Unicode content without newline should return False."""
+        result = self.file_ops._ends_with_newline("hello 世界")
+        assert result is False
+    
+    def test_special_characters_with_newline(self):
+        """Content with special characters ending with newline should return True."""
+        result = self.file_ops._ends_with_newline("test $PATH && echo 'done'\n")
+        assert result is True
+    
+    def test_special_characters_without_newline(self):
+        """Content with special characters without newline should return False."""
+        result = self.file_ops._ends_with_newline("test $PATH && echo 'done'")
+        assert result is False
+    
+    def test_binary_like_content_with_newline(self):
+        """Binary-like content ending with newline should return True."""
+        result = self.file_ops._ends_with_newline("\x00\x01\x02\n")
+        assert result is True
+    
+    def test_binary_like_content_without_newline(self):
+        """Binary-like content without newline should return False."""
+        result = self.file_ops._ends_with_newline("\x00\x01\x02")
+        assert result is False
 
 
 # ============================================================================
-# Test _escape_shell_arg for safe shell escaping (Task 9)
+# Test _escape_shell_arg helper (Task 9)
 # ============================================================================
 
 class TestEscapeShellArg:
@@ -335,19 +295,23 @@ class TestShellCommandSafety:
         assert str(file_path) in cmd or self.file_ops._escape_shell_arg(str(file_path)) in cmd
     
     def test_malicious_path_in_ends_with_newline(self):
-        """Verify _ends_with_newline properly escapes malicious paths."""
-        malicious_path = "/tmp/$(rm -rf /)"
+        """Verify _ends_with_newline handles malicious-looking content safely.
         
-        self.mock_env.execute.return_value = {"output": "", "returncode": 1}
+        The optimized version checks content in-memory rather than spawning
+        a subprocess, so malicious path strings are simply treated as content
+        to check for trailing newlines - no shell escaping needed.
+        """
+        malicious_content = "/tmp/$(rm -rf /)"
         
-        # Should not raise an exception
-        result = self.file_ops._ends_with_newline(malicious_path)
+        # Should not raise an exception - just treats it as plain content
+        result = self.file_ops._ends_with_newline(malicious_content)
         
-        # Verify execute was called with a properly escaped command
-        call_args = self.mock_env.execute.call_args
-        command = call_args[0][0] if call_args else ""
+        # No subprocess should be called (optimized version works in-memory)
+        assert self.mock_env.execute.call_count == 0
         
-        # The malicious path should be quoted in the command
-        assert "'" in command
-        # Command substitution should be inside quotes (neutralized)
-        assert "$(" in command  # Present but inside quotes
+        # Result should be False (no trailing newline)
+        assert result is False
+        
+        # With trailing newline, should return True
+        result_with_newline = self.file_ops._ends_with_newline(malicious_content + "\n")
+        assert result_with_newline is True

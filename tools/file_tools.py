@@ -1,11 +1,26 @@
 #!/usr/bin/env python3
-"""File Tools Module - LLM agent file manipulation tools."""
+"""
+File Tools Module - LLM agent file manipulation tools.
+
+This module provides high-level file manipulation tools (read, write, patch, search)
+that wrap the ShellFileOperations class from file_operations.py. It adds:
+
+1. Consecutive read/search loop detection via ReadTracker
+2. Security checks (blocking reads of internal Hermes files)
+3. Sensitive data redaction in file contents
+4. Tool registration with the central registry
+
+The read_tracker module handles all consecutive-read detection logic, while this
+module focuses on tool orchestration and integration.
+"""
 
 import errno
 import json
 import logging
+import os
 import threading
 from tools.file_operations import ShellFileOperations
+from tools.read_tracker import get_tracker
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
@@ -26,13 +41,8 @@ def _is_expected_write_exception(exc: Exception) -> bool:
 _file_ops_lock = threading.Lock()
 _file_ops_cache: dict = {}
 
-# Track files read per task to detect re-read loops after context compression.
-# Per task_id we store:
-#   "last_key":     the key of the most recent read/search call (or None)
-#   "consecutive":  how many times that exact call has been repeated in a row
-#   "read_history": set of (path, offset, limit) tuples for get_read_files_summary
-_read_tracker_lock = threading.Lock()
-_read_tracker: dict = {}
+# Global read tracker instance
+_read_tracker = get_tracker()
 
 
 def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
@@ -156,7 +166,7 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
     return file_ops
 
 
-def clear_file_ops_cache(task_id: str = None):
+def clear_file_ops_cache(task_id: str = None) -> None:
     """Clear the file operations cache."""
     with _file_ops_lock:
         if task_id:
@@ -166,7 +176,12 @@ def clear_file_ops_cache(task_id: str = None):
 
 
 def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = "default") -> str:
-    """Read a file with pagination and line numbers."""
+    """
+    Read a file with pagination and line numbers.
+    
+    Includes consecutive-read loop detection to prevent the agent from
+    getting stuck re-reading the same file region repeatedly.
+    """
     try:
         # Security: block direct reads of internal Hermes cache/index files
         # to prevent prompt injection via catalog or hub metadata files.
@@ -190,45 +205,29 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
                 })
             except ValueError:
                 pass
+
+        # Check for consecutive read loops using ReadTracker
+        check_result = _read_tracker.check_and_increment(
+            "read", task_id, path=path, offset=offset, limit=limit
+        )
+        
+        # BLOCK: Return immediately if threshold exceeded
+        if check_result.blocked:
+            return json.dumps(
+                check_result.block_message("read", {"path": path}),
+                ensure_ascii=False
+            )
+
+        # Execute the file operation
         file_ops = _get_file_ops(task_id)
         result = file_ops.read_file(path, offset, limit)
         if result.content:
             result.content = redact_sensitive_text(result.content)
         result_dict = result.to_dict()
 
-        # Track reads to detect *consecutive* re-read loops.
-        # The counter resets whenever any other tool is called in between,
-        # so only truly back-to-back identical reads trigger warnings/blocks.
-        read_key = ("read", path, offset, limit)
-        with _read_tracker_lock:
-            task_data = _read_tracker.setdefault(task_id, {
-                "last_key": None, "consecutive": 0, "read_history": set(),
-            })
-            task_data["read_history"].add((path, offset, limit))
-            if task_data["last_key"] == read_key:
-                task_data["consecutive"] += 1
-            else:
-                task_data["last_key"] = read_key
-                task_data["consecutive"] = 1
-            count = task_data["consecutive"]
-
-        if count >= 4:
-            # Hard block: stop returning content to break the loop
-            return json.dumps({
-                "error": (
-                    f"BLOCKED: You have read this exact file region {count} times in a row. "
-                    "The content has NOT changed. You already have this information. "
-                    "STOP re-reading and proceed with your task."
-                ),
-                "path": path,
-                "already_read": count,
-            }, ensure_ascii=False)
-        elif count >= 3:
-            result_dict["_warning"] = (
-                f"You have read this exact file region {count} times consecutively. "
-                "The content has not changed since your last read. Use the information you already have. "
-                "If you are stuck in a loop, stop reading and proceed with writing or responding."
-            )
+        # WARN: Add warning to result if threshold exceeded
+        if check_result.warned:
+            result_dict["_warning"] = check_result.warn_message("read")
 
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
@@ -236,53 +235,82 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, task_id: str = 
 
 
 def get_read_files_summary(task_id: str = "default") -> list:
-    """Return a list of files read in this session for the given task.
+    """
+    Return a list of files read in this session for the given task.
 
     Used by context compression to preserve file-read history across
     compression boundaries.
+    
+    Args:
+        task_id: Task/session identifier
+        
+    Returns:
+        List of dicts with "path" and "regions" keys
     """
-    with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id, {})
-        read_history = task_data.get("read_history", set())
-        seen_paths: dict = {}
-        for (path, offset, limit) in read_history:
-            if path not in seen_paths:
-                seen_paths[path] = []
-            seen_paths[path].append(f"lines {offset}-{offset + limit - 1}")
-        return [
-            {"path": p, "regions": regions}
-            for p, regions in sorted(seen_paths.items())
-        ]
+    return _read_tracker.get_read_history(task_id)
 
 
-def clear_read_tracker(task_id: str = None):
-    """Clear the read tracker.
+def clear_read_tracker(task_id: str = None) -> None:
+    """
+    Clear the read tracker.
 
     Call with a task_id to clear just that task, or without to clear all.
     Should be called when a session is destroyed to prevent memory leaks
     in long-running gateway processes.
+    
+    Args:
+        task_id: Task ID to clear, or None to clear all
     """
-    with _read_tracker_lock:
-        if task_id:
-            _read_tracker.pop(task_id, None)
-        else:
-            _read_tracker.clear()
+    _read_tracker.clear(task_id)
 
 
-def notify_other_tool_call(task_id: str = "default"):
-    """Reset consecutive read/search counter for a task.
+def set_investigation_mode(task_id: str = "default", enabled: bool = True) -> None:
+    """
+    Set investigation mode for a specific task/session.
+
+    In investigation mode, stricter thresholds are applied to prevent
+    the agent from getting stuck in re-read loops during debugging.
+    Block threshold: 2 (instead of 4)
+    Warn threshold: 2 (instead of 3)
+
+    This is per-session (per task_id), not a global flag.
+
+    Args:
+        task_id: The task/session ID to modify
+        enabled: True to enable stricter thresholds, False for normal mode
+    """
+    _read_tracker.set_investigation_mode(task_id, enabled)
+    logger.debug("Investigation mode %s for task %s",
+                 "enabled" if enabled else "disabled", task_id[:8])
+
+
+def get_investigation_mode(task_id: str = "default") -> bool:
+    """
+    Get the investigation mode status for a specific task/session.
+
+    Args:
+        task_id: The task/session ID to query
+
+    Returns:
+        True if investigation mode is enabled (stricter thresholds), False otherwise
+    """
+    return _read_tracker.get_investigation_mode(task_id)
+
+
+def notify_other_tool_call(task_id: str = "default") -> None:
+    """
+    Reset consecutive read/search counter for a task.
 
     Called by the tool dispatcher (model_tools.py) whenever a tool OTHER
     than read_file / search_files is executed.  This ensures we only warn
     or block on *truly consecutive* repeated reads — if the agent does
     anything else in between (write, patch, terminal, etc.) the counter
     resets and the next read is treated as fresh.
+    
+    Args:
+        task_id: Task/session identifier
     """
-    with _read_tracker_lock:
-        task_data = _read_tracker.get(task_id)
-        if task_data:
-            task_data["last_key"] = None
-            task_data["consecutive"] = 0
+    _read_tracker.reset_counter(task_id)
 
 
 def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
@@ -334,58 +362,51 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
                 file_glob: str = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
                 task_id: str = "default") -> str:
-    """Search for content or files."""
+    """
+    Search for content or files with consecutive-search loop detection.
+    
+    Tracks repeated searches to prevent the agent from getting stuck
+    running the same search over and over.
+    """
     try:
-        # Track searches to detect *consecutive* repeated search loops.
-        # Include pagination args so users can page through truncated
-        # results without tripping the repeated-search guard.
-        search_key = (
-            "search",
-            pattern,
-            target,
-            str(path),
-            file_glob or "",
-            limit,
-            offset,
+        # Check for consecutive search loops using ReadTracker
+        check_result = _read_tracker.check_and_increment(
+            "search", task_id,
+            pattern=pattern, target=target, path=path,
+            file_glob=file_glob, limit=limit, offset=offset
         )
-        with _read_tracker_lock:
-            task_data = _read_tracker.setdefault(task_id, {
-                "last_key": None, "consecutive": 0, "read_history": set(),
-            })
-            if task_data["last_key"] == search_key:
-                task_data["consecutive"] += 1
-            else:
-                task_data["last_key"] = search_key
-                task_data["consecutive"] = 1
-            count = task_data["consecutive"]
+        
+        # BLOCK: Return immediately if threshold exceeded
+        if check_result.blocked:
+            return json.dumps(
+                check_result.block_message("search", {"pattern": pattern}),
+                ensure_ascii=False
+            )
 
-        if count >= 4:
-            return json.dumps({
-                "error": (
-                    f"BLOCKED: You have run this exact search {count} times in a row. "
-                    "The results have NOT changed. You already have this information. "
-                    "STOP re-searching and proceed with your task."
-                ),
-                "pattern": pattern,
-                "already_searched": count,
-            }, ensure_ascii=False)
-
+        # Execute the search operation
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
-            pattern=pattern, path=path, target=target, file_glob=file_glob,
-            limit=limit, offset=offset, output_mode=output_mode, context=context
+            pattern=pattern,
+            path=path,
+            target=target,
+            file_glob=file_glob,
+            limit=limit,
+            offset=offset,
+            output_mode=output_mode,
+            context=context,
         )
+
+        # WARN: Add warning to result if threshold exceeded
+        if check_result.warned:
+            result_dict = result.to_dict()
+            result_dict["_warning"] = check_result.warn_message("search")
+            return json.dumps(result_dict, ensure_ascii=False)
+        
         if hasattr(result, 'matches'):
             for m in result.matches:
                 if hasattr(m, 'content') and m.content:
                     m.content = redact_sensitive_text(m.content)
         result_dict = result.to_dict()
-
-        if count >= 3:
-            result_dict["_warning"] = (
-                f"You have run this exact search {count} times consecutively. "
-                "The results have not changed. Use the information you already have."
-            )
 
         result_json = json.dumps(result_dict, ensure_ascii=False)
         # Hint when results were truncated — explicit next offset is clearer
@@ -406,7 +427,7 @@ FILE_TOOLS = [
 ]
 
 
-def get_file_tools():
+def get_file_tools() -> list:
     """Get the list of file tool definitions."""
     return FILE_TOOLS
 
