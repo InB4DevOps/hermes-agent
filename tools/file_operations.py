@@ -462,6 +462,27 @@ class ShellFileOperations(FileOperations):
     # READ Implementation
     # =========================================================================
     
+    def _ends_with_newline(self, path: str) -> bool:
+        """Check if a file ends with a newline character.
+        
+        Uses tail to read the last byte and checks if it is a newline.
+        Much simpler and more reliable than complex shell pipelines.
+        
+        Args:
+            path: File path to check
+            
+        Returns:
+            True if file ends with newline, False otherwise
+        """
+        # Use tail -c 1 to get the last byte
+        # If the file ends with newline, output will be '\n'
+        # If not, output will be the last character without newline
+        last_byte_cmd = f"tail -c 1 {self._escape_shell_arg(path)} 2>/dev/null"
+        last_byte_result = self._exec(last_byte_cmd)
+        
+        # Check if the last byte is a newline character
+        return last_byte_result.stdout == '\n'
+    
     def read_file(self, path: str, offset: int = 1, limit: int = 500) -> ReadResult:
         """
         Read a file with pagination, binary detection, and line numbers.
@@ -530,10 +551,17 @@ class ShellFileOperations(FileOperations):
             return ReadResult(error=f"Failed to read file: {read_result.stdout}")
         
         # Get total line count
+        # NOTE: wc -l counts newline characters, not lines. A file without a
+        # trailing newline will undercount by 1. We fix this by checking if
+        # the file ends with a newline using our reliable Python-based method.
         wc_cmd = f"wc -l < {self._escape_shell_arg(path)}"
         wc_result = self._exec(wc_cmd)
         try:
             total_lines = int(wc_result.stdout.strip())
+            # Check if file ends without newline using our reliable method
+            if not self._ends_with_newline(path):
+                # File doesn't end with newline, wc -l undercounted by 1
+                total_lines += 1
         except ValueError:
             total_lines = 0
         
