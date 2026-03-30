@@ -157,3 +157,23 @@ class TestResumePreservesProgress:
 
         assert checkpoint_data["completed_prompts"] == []
         assert checkpoint_data["run_name"] == "test_run"
+
+
+class TestLoggerInitialization:
+    """Verify module-level logger is properly initialized."""
+
+    def test_logger_is_defined(self):
+        """Test that logger is defined at module level to prevent NameError."""
+        from batch_runner import logger
+        assert logger is not None
+
+    def test_logger_has_correct_name(self):
+        """Test that logger uses __name__ for proper hierarchy."""
+        from batch_runner import logger
+        assert logger.name == "batch_runner"
+
+    def test_logger_is_usable(self):
+        """Test that logger can be used without raising NameError."""
+        from batch_runner import logger
+        # This should not raise NameError
+        logger.error("Test message", exc_info=False)

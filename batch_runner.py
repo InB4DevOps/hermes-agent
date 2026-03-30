@@ -33,6 +33,9 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRe
 from rich.console import Console
 import fire
 
+# Module-level logger for error handling in exception handlers
+logger = logging.getLogger(__name__)
+
 from run_agent import AIAgent
 from toolset_distributions import (
     list_distributions, 
