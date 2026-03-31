@@ -82,6 +82,21 @@ class TestEnvAssignments:
         result = redact_sensitive_text(text)
         assert result == text
 
+    def test_lowercase_python_vars_not_redacted(self):
+        """Regression test: lowercase Python variable assignments should NOT be redacted.
+        
+        This was causing issues with code like:
+        before_tokens = self._estimate_current_context_tokens()
+        """
+        test_cases = [
+            "before_tokens = self._estimate_current_context_tokens()",
+            "my_token = some_value",
+            "api_key = secret",
+        ]
+        for text in test_cases:
+            result = redact_sensitive_text(text)
+            assert result == text, f"Expected '{text}' to remain unchanged, got '{result}'"
+
 
 class TestJsonFields:
     def test_json_api_key(self):

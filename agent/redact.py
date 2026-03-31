@@ -51,10 +51,10 @@ _PREFIX_PATTERNS = [
 ]
 
 # ENV assignment patterns: KEY=value where KEY contains a secret-like name
+# Must be ALL uppercase (environment variables, not Python variables like before_tokens)
 _SECRET_ENV_NAMES = r"(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)"
 _ENV_ASSIGN_RE = re.compile(
-    rf"([A-Z_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2",
-    re.IGNORECASE,
+    rf"(?:^|\s)([A-Z_]{{1,64}}{_SECRET_ENV_NAMES}[A-Z_]{{0,64}})\s*=\s*(['\"]?)(\S+)\2",
 )
 
 # JSON field patterns: "apiKey": "value", "token": "value", etc.
