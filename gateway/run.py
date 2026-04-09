@@ -2166,6 +2166,14 @@ class GatewayRunner:
         if canonical == "voice":
             return await self._handle_voice_command(event)
 
+        if canonical == "clear-context":
+            return await self._handle_clear_context_command(event)
+
+        if canonical == "start-tasks":
+            return await self._handle_start_tasks_command(event)
+        if canonical == "end-tasks":
+            return await self._handle_end_tasks_command(event)
+
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
             if isinstance(self.config, dict):
@@ -4135,6 +4143,125 @@ class GatewayRunner:
                 if adapter:
                     self._set_adapter_auto_tts_disabled(adapter, chat_id, disabled=True)
                 return "Voice mode disabled."
+
+    # =========================================================================
+    # Context management handlers (clear-context)
+    # =========================================================================
+
+    async def _handle_clear_context_command(self, event: MessageEvent) -> str:
+        """Handle /clear-context [all|recent|task] — partial context reset."""
+        from agent.model_metadata import estimate_session_token_count_from_rows
+        
+        args = event.get_command_args().strip().lower()
+        mode = args if args in ("all", "recent", "task", "auto") else "auto"
+
+        session_id = event.source.chat_id
+
+        # Helper to estimate current context tokens
+        def estimate_tokens(sid: str) -> int:
+            try:
+                messages = self.session_store.db.get_messages(sid)
+                return estimate_session_token_count_from_rows(messages)
+            except Exception:
+                return 0
+
+        # Get session message count and token estimate before
+        before_count = self.session_store.db.message_count(session_id)
+        before_tokens = estimate_tokens(session_id)
+
+        if mode == "recent":
+            # Prune last 10 messages
+            removed = self.session_store.db.prune_messages(session_id, count=10)
+            msg = f"✂️ Pruned {removed} recent message(s)"
+        elif mode == "task":
+            # Clear only ephemeral messages from the completed task window
+            removed = self.session_store.db.clear_task_window_ephemeral_messages(session_id)
+            msg = f"🧹 Cleared {removed} task-window ephemeral message(s)"
+        else:
+            # Clear all ephemeral messages (default: auto and all)
+            removed = self.session_store.db.clear_ephemeral_messages(session_id)
+            msg = f"🧹 Cleared {removed} ephemeral message(s)"
+
+        after_count = self.session_store.db.message_count(session_id)
+        after_tokens = estimate_tokens(session_id)
+        
+        # Update agent's context compressor if there's a running agent
+        session_key = self._session_key_for_source(event.source)
+        agent = self._running_agents.get(session_key)
+        if agent and hasattr(agent, 'context_compressor') and agent.context_compressor:
+            agent.context_compressor.last_prompt_tokens = after_tokens
+        
+        # Build response with token info
+        lines = [msg]
+        token_diff = before_tokens - after_tokens
+        if token_diff > 0:
+            from agent.usage_pricing import format_token_count_compact
+            lines.append(f"📉 Context reduced by ~{format_token_count_compact(token_diff)} tokens "
+                        f"(~{format_token_count_compact(after_tokens)} remaining)")
+        elif token_diff < 0:
+            from agent.usage_pricing import format_token_count_compact
+            lines.append(f"📈 Context increased by ~{format_token_count_compact(abs(token_diff))} tokens "
+                        f"(~{format_token_count_compact(after_tokens)} total)")
+        
+        lines.append("")
+        lines.append(f"Session now has {after_count} message(s) (was {before_count})")
+        
+        return "\n".join(lines)
+
+    # =========================================================================
+    # Task list handlers (start-tasks / end-tasks)
+    # =========================================================================
+
+    async def _handle_start_tasks_command(self, event: MessageEvent) -> str:
+        """Handle /start-tasks — enter task definition mode."""
+        db = self.session_store.db
+        session_id = event.source.chat_id
+
+        if db.is_task_definition_mode_active(session_id):
+            return (
+                "⏳ Task definition mode is already active\n"
+                "Type your tasks below, then /end-tasks to execute"
+            )
+
+        db.enter_task_definition_mode(session_id)
+        return (
+            "📋 Task definition mode started\n"
+            "Type each task on a separate message:\n"
+            "  Write the API documentation\n"
+            "  Add unit tests\n"
+            "  Deploy to production\n"
+            "Then type /end-tasks to execute all tasks with auto-clear between each"
+        )
+
+    async def _handle_end_tasks_command(self, event: MessageEvent) -> str:
+        """Handle /end-tasks — exit task definition mode and execute task train."""
+        db = self.session_store.db
+        session_id = event.source.chat_id
+
+        tasks = db.get_task_definitions(session_id)
+        was_active = db.is_task_definition_mode_active(session_id)
+
+        if not was_active and len(tasks) == 0:
+            return "No tasks defined"
+
+        # Exit task definition mode
+        if was_active:
+            db.exit_task_definition_mode(session_id)
+
+        task_count = len(tasks)
+        if task_count == 0:
+            return "No tasks defined to execute"
+
+        lines = [f"🚀 Starting task train with {task_count} task(s):"]
+        for i, task in enumerate(tasks, 1):
+            lines.append(f"  {i}. {task['content'][:60]}...")
+
+        # Note: Gateway task train execution is more complex due to async nature
+        # For now, we'll just acknowledge the tasks
+        lines.append("\n⚠️ Task train execution in gateway mode requires additional setup.")
+        lines.append("The tasks have been buffered. Please use CLI mode for full task train support.")
+
+        return "\n".join(lines)
 
     async def _handle_voice_channel_join(self, event: MessageEvent) -> str:
         """Join the user's current Discord voice channel."""

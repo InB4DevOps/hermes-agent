@@ -23,7 +23,39 @@ import threading
 import time
 from pathlib import Path
 from hermes_constants import get_hermes_home
-from typing import Any, Callable, Dict, List, Optional, TypeVar
+from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar, Union
+
+# ============================================================================
+# Constants for magic numbers
+# ============================================================================
+# Maximum character length for message content before it is classified as
+# ephemeral.  This captures large file dumps, long terminal outputs, and
+# verbose tool responses that bloat context but are safe to discard on
+# /clear-context. 5000 chars ≈ 1250 tokens — well above a typical user
+# prompt or short assistant reply, but short enough to catch file contents.
+MAX_EPHEMERAL_CONTENT_LENGTH = 5000
+
+# Default number of most-recent non-system messages to remove when the user
+# runs /clear-context recent.  10 was chosen as a pragmatic balance: enough
+# to reclaim meaningful context space (usually 2-5 tool call rounds) without
+# blowing away the entire conversation.
+DEFAULT_PRUNE_COUNT = 10
+
+# LIKE patterns used in SQL candidate filters to identify ephemeral messages.
+# Extracted as constants so they are testable, adjustable, and documented in
+# one place — rather than embedded in raw SQL strings.
+_EPHEMERAL_SQL_PATTERNS: tuple[str, ...] = (
+    '%stdout:%',
+    '%\nstdout:%',
+    '%exit_code:%',
+    '%\nexit_code:%',
+    '%Error:%',
+    '%Exception:%',
+)
+# Combined condition for use in SQL WHERE clauses (OR'd together).
+_EPHEMERAL_LIKE_CONDITIONS = " OR ".join(
+    f"content LIKE ? " for _ in _EPHEMERAL_SQL_PATTERNS
+)
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +63,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 10
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -65,6 +97,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    task_protection_active INTEGER DEFAULT 0,
+    task_definition_mode INTEGER DEFAULT 0,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -81,7 +115,11 @@ CREATE TABLE IF NOT EXISTS messages (
     finish_reason TEXT,
     reasoning TEXT,
     reasoning_details TEXT,
-    codex_reasoning_items TEXT
+    codex_reasoning_items TEXT,
+    task_id TEXT,
+    is_ephemeral INTEGER DEFAULT 0,
+    protected INTEGER DEFAULT 0,
+    task_definition INTEGER DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
@@ -287,7 +325,7 @@ class SessionDB:
                     pass  # Index already exists
                 cursor.execute("UPDATE schema_version SET version = 4")
             if current_version < 5:
-                new_columns = [
+                new_columns: List[Tuple[str, str]] = [
                     ("cache_read_tokens", "INTEGER DEFAULT 0"),
                     ("cache_write_tokens", "INTEGER DEFAULT 0"),
                     ("reasoning_tokens", "INTEGER DEFAULT 0"),
@@ -305,10 +343,10 @@ class SessionDB:
                         # name and column_type come from the hardcoded tuple above,
                         # not user input. Double-quote identifier escaping is applied
                         # as defense-in-depth; SQLite DDL cannot be parameterized.
-                        safe_name = name.replace('"', '""')
+                        safe_name: str = name.replace('"', '""')
                         cursor.execute(f'ALTER TABLE sessions ADD COLUMN "{safe_name}" {column_type}')
-                    except sqlite3.OperationalError:
-                        pass
+                    except sqlite3.OperationalError as e:
+                        logger.warning(f"Failed to add {name} column: {e}")
                 cursor.execute("UPDATE schema_version SET version = 5")
             if current_version < 6:
                 # v6: add reasoning columns to messages table — preserves assistant
@@ -329,6 +367,50 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                # v7: add task_id and is_ephemeral columns for context management
+                # task_id allows marking messages as belonging to a specific task
+                # is_ephemeral marks messages that can be safely cleared (tool outputs, file contents)
+                for col_name, col_type in [
+                    ("task_id", "TEXT"),
+                    ("is_ephemeral", "INTEGER DEFAULT 0"),
+                ]:
+                    try:
+                        safe = col_name.replace('"', '""')
+                        cursor.execute(
+                            f'ALTER TABLE messages ADD COLUMN "{safe}" {col_type}'
+                        )
+                    except sqlite3.OperationalError:
+                        pass  # Column already exists
+                cursor.execute("UPDATE schema_version SET version = 7")
+            if current_version < 8:
+                # v8: add protected column for task protection
+                # Messages added while task_protection_active=1 on the session are
+                # automatically marked as protected, surviving /clear-context
+                try:
+                    cursor.execute('ALTER TABLE messages ADD COLUMN "protected" INTEGER DEFAULT 0')
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+                cursor.execute("UPDATE schema_version SET version = 8")
+            if current_version < 9:
+                # v9: add task_protection_active to sessions for implicit tracking
+                try:
+                    cursor.execute('ALTER TABLE sessions ADD COLUMN "task_protection_active" INTEGER DEFAULT 0')
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+                cursor.execute("UPDATE schema_version SET version = 9")
+            if current_version < 10:
+                # v10: add task_definition_mode to sessions and task_definition to messages
+                # for task train feature (/start-tasks ... /end-tasks with auto-clear)
+                try:
+                    cursor.execute('ALTER TABLE sessions ADD COLUMN "task_definition_mode" INTEGER DEFAULT 0')
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+                try:
+                    cursor.execute('ALTER TABLE messages ADD COLUMN "task_definition" INTEGER DEFAULT 0')
+                except sqlite3.OperationalError:
+                    pass  # Column already exists
+                cursor.execute("UPDATE schema_version SET version = 10")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -867,12 +949,18 @@ class SessionDB:
         reasoning: str = None,
         reasoning_details: Any = None,
         codex_reasoning_items: Any = None,
+        protected: bool = False,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
 
         Also increments the session's message_count (and tool_call_count
         if role is 'tool' or tool_calls is present).
+
+        Args:
+            protected: When True, the message is excluded from clear-context
+                and prune operations. Always set to True when the session's
+                task_protection_active flag is 1 (implicit protection).
         """
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
@@ -891,11 +979,23 @@ class SessionDB:
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
 
         def _do(conn):
+            # Check if task protection is active for this session — if so,
+            # auto-protect all new messages regardless of the protected param.
+            is_protected = 1 if protected else 0
+            if not is_protected:
+                cursor = conn.execute(
+                    "SELECT task_protection_active FROM sessions WHERE id = ?",
+                    (session_id,),
+                )
+                row = cursor.fetchone()
+                if row and row[0]:
+                    is_protected = 1
+
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, timestamp, token_count, finish_reason,
-                   reasoning, reasoning_details, codex_reasoning_items)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   reasoning, reasoning_details, codex_reasoning_items, protected)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -909,6 +1009,7 @@ class SessionDB:
                     reasoning,
                     reasoning_details_json,
                     codex_items_json,
+                    is_protected,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -1300,5 +1401,459 @@ class SessionDB:
                 conn.execute("DELETE FROM messages WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM sessions WHERE id = ?", (sid,))
             return len(session_ids)
+
+        return self._execute_write(_do)
+
+    # =========================================================================
+    # Context management (clear-context)
+    # =========================================================================
+
+    @staticmethod
+    def is_ephemeral_message(msg: Dict[str, Any]) -> bool:
+        """Determine if a message can be safely cleared.
+
+        Ephemeral messages include:
+        - Tool results (role='tool')
+        - Long file contents (>5000 chars)
+        - Terminal outputs (contain stdout/exit_code)
+        - Error traces (unless critical)
+        - Memory retrieval results
+
+        Args:
+            msg: A message dict with 'role' and 'content' keys
+
+        Returns:
+            True if the message should be cleared by /clear-context
+        """
+        content: str = msg.get("content", "") or ""
+        role: str = msg.get("role", "")
+
+        # Tool results are ephemeral
+        if role == "tool":
+            return True
+
+        # Long file contents (likely from file_tools)
+        if len(content) > MAX_EPHEMERAL_CONTENT_LENGTH:
+            return True
+
+        # Terminal outputs — require a structured pattern to avoid false
+        # positives on casual mentions like "I'm parsing stdout" or
+        # "the exit_code was 0".  We look for key/value-style formatting
+        # that matches real tool output formats:
+        #   JSON-style:   "stdout": ... / "exit_code": ...
+        #   Line-start:   stdout: value / exit_code: value
+        if re.search(r'"stdout"', content) or re.search(r'"exit_code"', content):
+            return True
+        if re.search(r'(?:^|\n)\s*stdout\s*:', content):
+            return True
+        if re.search(r'(?:^|\n)\s*exit_code\s*:', content):
+            return True
+
+        # Error traces (check if critical)
+        if "Error:" in content or "Exception:" in content:
+            # Skip critical errors that affect task execution
+            if not any(crit in content.lower() for crit in ["fatal", "critical", "cannot", "failed to create"]):
+                return True
+
+        # Memory retrieval results
+        if "memory" in content.lower() and ("retrieved" in content.lower() or "found" in content.lower()):
+            return True
+
+        return False
+
+    def classify_messages(self, session_id: str) -> Dict[str, List[Dict[str, Any]]]:
+        """Classify all messages into persistent and ephemeral.
+
+        Args:
+            session_id: The session to classify
+
+        Returns:
+            Dict with 'persistent' and 'ephemeral' lists of messages
+        """
+        messages = self.get_messages(session_id)
+        persistent: List[Dict[str, Any]] = []
+        ephemeral: List[Dict[str, Any]] = []
+
+        for msg in messages:
+            if self.is_ephemeral_message(msg):
+                ephemeral.append(msg)
+            else:
+                persistent.append(msg)
+
+        return {"persistent": persistent, "ephemeral": ephemeral}
+
+    def clear_ephemeral_messages(self, session_id: str) -> int:
+        """Remove all ephemeral messages for a session.
+
+        Uses a two-phase approach for performance:
+        1. Push cheap, SQL-expressible heuristics into a single SELECT to get
+           candidate IDs (tool role, long content, stdout-like patterns).
+        2. Filter candidates in Python for nuanced rules (critical errors,
+           memory retrieval), then issue one batched DELETE.
+
+        Keeps:
+        - System messages
+        - User prompts
+        - Assistant responses (summaries, explanations)
+
+        Removes:
+        - Tool results
+        - File contents
+        - Terminal outputs
+        - Error traces
+
+        Args:
+            session_id: The session to clear
+
+        Returns:
+            Number of messages removed
+        """
+        def _do(conn):
+            # --- Phase 1: SQL-fast path for trivially-ephemeral messages,
+            #            plus candidate IDs for nuanced Python filtering.
+            #
+            # SQL can directly express:
+            #   role = 'tool'
+            #   LENGTH(content) > 5000
+            #   content contains exit_code or stdout patterns
+            #   content contains Error:/Exception: (critical check done below)
+            #   content contains memory retrieval patterns
+            #
+            # We fetch candidate rows and let Python make the final call on
+            # each.  This avoids N+1 DELETEs while still honouring the
+            # nuanced classification logic.
+
+            # Build parameter list: session_id, max_length, then one param per
+            # LIKE pattern in _EPHEMERAL_SQL_PATTERNS.
+            like_params = list(_EPHEMERAL_SQL_PATTERNS)
+            cursor = conn.execute(
+                f"""SELECT id, role, content, protected FROM messages
+                    WHERE session_id = ? AND protected = 0
+                      AND (
+                            role = 'tool'
+                         OR LENGTH(content) > ?
+                         OR {_EPHEMERAL_LIKE_CONDITIONS}
+                         OR (LOWER(content) LIKE '%memory%' AND
+                             (LOWER(content) LIKE '%retrieved%' OR LOWER(content) LIKE '%found%'))
+                      )""",
+                (session_id, MAX_EPHEMERAL_CONTENT_LENGTH, *like_params),
+            )
+            rows = cursor.fetchall()
+
+            # --- Phase 2: Python-level nuanced filtering (critical errors). ---
+            ids_to_delete: List[int] = []
+            for row in rows:
+                # row is (id, role, content, protected)
+                msg = {"role": row[1], "content": row[2]}
+                if row[3]:
+                    # protected (row-level sanity check, though SQL already
+                    # excluded protected=1)
+                    continue
+                if self.is_ephemeral_message(msg):
+                    ids_to_delete.append(row[0])
+
+            if ids_to_delete:
+                placeholders = ",".join("?" * len(ids_to_delete))
+                conn.execute(
+                    f"DELETE FROM messages WHERE id IN ({placeholders})",
+                    ids_to_delete,
+                )
+
+            return len(ids_to_delete)
+
+        return self._execute_write(_do)
+
+    def protect_messages_after(self, session_id: str, after_timestamp: float = None) -> int:
+        """Mark messages as protected starting from a given timestamp.
+        
+        If after_timestamp is None, protects all the most recent messages
+        (i.e., nothing is protected yet in this session).
+        
+        Args:
+            session_id: The session to protect messages in
+            after_timestamp: Protect all messages with timestamp > this value.
+                If None, finds the latest existing message timestamp and protects
+                everything strictly after it (i.e., new messages from now on).
+        
+        Returns:
+            Number of messages now protected
+        """
+        cutoff = after_timestamp  # capture before _do to avoid UnboundLocalError
+        
+        def _do(conn):
+            nonlocal cutoff
+            if cutoff is None:
+                # Find latest message timestamp for this session
+                cursor = conn.execute(
+                    "SELECT MAX(timestamp) FROM messages WHERE session_id = ?",
+                    (session_id,),
+                )
+                row = cursor.fetchone()
+                cutoff = row[0] if row and row[0] else 0
+            
+            cursor = conn.execute(
+                "UPDATE messages SET protected = 1 WHERE session_id = ? AND timestamp > ? AND protected = 0",
+                (session_id, cutoff),
+            )
+            updated = cursor.rowcount
+            return updated
+        
+        return self._execute_write(_do)
+
+    def unprotect_all_messages(self, session_id: str) -> int:
+        """Remove protection from all messages in a session.
+        
+        Returns:
+            Number of messages unprotected
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET protected = 0 WHERE session_id = ? AND protected = 1",
+                (session_id,),
+            )
+            return cursor.rowcount
+        
+        return self._execute_write(_do)
+
+    def start_task_protection(self, session_id: str) -> bool:
+        """Enable task protection for a session — new messages are auto-protected.
+
+        Returns True if protection was activated (was not already active).
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET task_protection_active = 1 WHERE id = ?",
+                (session_id,),
+            )
+            return cursor.rowcount > 0
+
+        return self._execute_write(_do)
+
+    def end_task_protection(self, session_id: str) -> bool:
+        """Disable task protection for a session — clears the flag.
+
+        Returns True if protection was deactivated (was active).
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET task_protection_active = 0 WHERE id = ?",
+                (session_id,),
+            )
+            return cursor.rowcount > 0
+
+        return self._execute_write(_do)
+
+    def is_task_protection_active(self, session_id: str) -> bool:
+        """Check whether task protection is currently active for a session."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT task_protection_active FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            return bool(row and row[0])
+
+    # =========================================================================
+    # Task Definition Mode (for /start-tasks ... /end-tasks task train)
+    # =========================================================================
+
+    def enter_task_definition_mode(self, session_id: str) -> bool:
+        """Enter task definition mode — messages are buffered, not sent to model.
+
+        Returns True if mode was activated (was not already active).
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET task_definition_mode = 1 WHERE id = ?",
+                (session_id,),
+            )
+            return cursor.rowcount > 0
+
+        return self._execute_write(_do)
+
+    def exit_task_definition_mode(self, session_id: str) -> bool:
+        """Exit task definition mode — buffer will be flushed.
+
+        Returns True if mode was deactivated (was active).
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE sessions SET task_definition_mode = 0 WHERE id = ?",
+                (session_id,),
+            )
+            return cursor.rowcount > 0
+
+        return self._execute_write(_do)
+
+    def is_task_definition_mode_active(self, session_id: str) -> bool:
+        """Check whether task definition mode is currently active."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT task_definition_mode FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            return bool(row and row[0])
+
+    def get_task_definitions(self, session_id: str) -> List[Dict[str, Any]]:
+        """Get all buffered task definitions for a session.
+
+        Returns list of task messages (role='user' messages in task definition mode).
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                """SELECT id, role, content, timestamp FROM messages
+                   WHERE session_id = ? AND role = 'user' AND task_definition = 1
+                   ORDER BY timestamp""",
+                (session_id,),
+            )
+            return [{"id": row[0], "role": row[1], "content": row[2], "timestamp": row[3]} for row in cursor.fetchall()]
+
+        return self._execute_write(_do)
+
+    def store_task_definition(self, session_id: str, content: str) -> int:
+        """Store a task definition message (buffered, not sent to model).
+
+        Args:
+            session_id: The session
+            content: The task description
+
+        Returns:
+            The ID of the inserted message
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT INTO messages (session_id, role, content, timestamp, task_definition)
+                   VALUES (?, 'user', ?, ?, 1)""",
+                (session_id, content, time.time()),
+            )
+            return cursor.lastrowid
+
+        return self._execute_write(_do)
+
+    def clear_task_definitions(self, session_id: str) -> int:
+        """Clear all buffered task definitions for a session.
+
+        Returns:
+            Number of definitions cleared
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "DELETE FROM messages WHERE session_id = ? AND task_definition = 1",
+                (session_id,),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do)
+
+    def get_protected_messages(self, session_id: str) -> List[float]:
+        """Get timestamps of all protected messages in a session.
+        
+        Returns a sorted list of timestamps to know which messages are protected
+        and to help determine what to protect next.
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                "SELECT timestamp FROM messages WHERE session_id = ? AND protected = 1 ORDER BY timestamp",
+                (session_id,),
+            )
+            return [row[0] for row in cursor.fetchall()]
+        
+        # This read needs to see uncommitted writes from our own connection,
+        # so use the direct connection in a lock.
+        with self._lock:
+            return _do(self._conn)
+
+    def clear_task_window_ephemeral_messages(self, session_id: str) -> int:
+        """Remove only ephemeral messages from the task window.
+
+        Task-window messages are those marked as protected=1 (added between
+        /start-tasks and /end-tasks).  This method clears the *noise* from
+        a completed task — tool outputs, file dumps, terminal results — while
+        preserving the user's task definition and the assistant's summary.
+
+        Uses the same two-phase approach as clear_ephemeral_messages but
+        targets protected=1 instead of protected=0.
+
+        Args:
+            session_id: The session to clear
+
+        Returns:
+            Number of task-window ephemeral messages removed
+        """
+        def _do(conn):
+            # Phase 1: SQL candidate filter — only fetch protected messages
+            # that look like they could be ephemeral.  This avoids pulling
+            # every protected message into Python when most are short user/
+            # assistant text.  The SQL filter is a superset; Python makes
+            # the final call (Phase 2).
+            like_params = list(_EPHEMERAL_SQL_PATTERNS)
+            cursor = conn.execute(
+                f"""SELECT id, role, content FROM messages
+                    WHERE session_id = ? AND protected = 1
+                      AND (role = 'tool'
+                           OR LENGTH(content) > ?
+                           OR {_EPHEMERAL_LIKE_CONDITIONS})""",
+                (session_id, MAX_EPHEMERAL_CONTENT_LENGTH, *like_params),
+            )
+            rows = cursor.fetchall()
+
+            # --- Phase 2: Python-level classification. ---
+            ids_to_delete: List[int] = []
+            for row in rows:
+                msg = {"role": row[1], "content": row[2]}
+                if self.is_ephemeral_message(msg):
+                    ids_to_delete.append(row[0])
+
+            if ids_to_delete:
+                # Delete the ephemeral ones (they're no longer needed)
+                placeholders = ",".join("?" * len(ids_to_delete))
+                conn.execute(
+                    f"DELETE FROM messages WHERE id IN ({placeholders})",
+                    ids_to_delete,
+                )
+
+            # Unprotect ALL remaining protected messages in this session.
+            # These are non-ephemeral user/assistant messages from the task
+            # window (task definitions and summaries) that should survive as
+            # normal messages after the task is complete.  A single UPDATE is
+            # cheaper than fetching IDs one-by-one.
+            conn.execute(
+                "UPDATE messages SET protected = 0 WHERE session_id = ? AND protected = 1",
+                (session_id,),
+            )
+
+            return len(ids_to_delete)
+
+        return self._execute_write(_do)
+
+    def prune_messages(self, session_id: str, count: int = DEFAULT_PRUNE_COUNT) -> int:
+        """Remove the last N messages from a session (excluding system messages).
+
+        Args:
+            session_id: The session to prune
+            count: Number of messages to remove (default: DEFAULT_PRUNE_COUNT)
+
+        Returns:
+            Number of messages removed
+        """
+        def _do(conn):
+            cursor = conn.execute(
+                """SELECT id FROM messages
+                   WHERE session_id = ? AND role != 'system' AND protected = 0
+                   ORDER BY timestamp DESC, id DESC
+                   LIMIT ?""",
+                (session_id, count),
+            )
+            message_ids: List[int] = [row["id"] for row in cursor.fetchall()]
+
+            if message_ids:
+                placeholders = ",".join("?" * len(message_ids))
+                conn.execute(
+                    f"DELETE FROM messages WHERE id IN ({placeholders})",
+                    message_ids,
+                )
+
+            return len(message_ids)
 
         return self._execute_write(_do)

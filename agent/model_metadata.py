@@ -981,6 +981,36 @@ def estimate_messages_tokens_rough(messages: List[Dict[str, Any]]) -> int:
     return total_chars // 4
 
 
+def estimate_session_token_count_from_rows(
+    db_rows: List[Dict[str, Any]],
+    *,
+    system_prompt: str = "",
+    tools=None,
+) -> int:
+    """Estimate total context tokens from raw DB message rows.
+
+    Converts database row dicts into the minimal {role, content, reasoning}
+    format expected by `estimate_request_tokens_rough`, then computes
+    the full request token count (messages + system + tool schemas).
+
+    Args:
+        db_rows: List of message row dicts (as returned by SessionDB.get_messages).
+        system_prompt: Optional system prompt text.
+        tools: Optional tool schema list.
+
+    Returns:
+        Estimated token count.
+    """
+    conv: List[Dict[str, Any]] = []
+    for row in db_rows:
+        msg: Dict[str, Any] = {"role": row.get("role", "unknown"),
+                               "content": row.get("content", "")}
+        if row.get("reasoning"):
+            msg["reasoning"] = row["reasoning"]
+        conv.append(msg)
+    return estimate_request_tokens_rough(conv, system_prompt=system_prompt, tools=tools)
+
+
 def estimate_request_tokens_rough(
     messages: List[Dict[str, Any]],
     *,

@@ -80,6 +80,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, aliases=("set-home",)),
     CommandDef("resume", "Resume a previously-named session", "Session",
                args_hint="[name]"),
+    CommandDef("clear-context", "Remove ephemeral messages (tool outputs, file contents) while keeping persistent context", "Session",
+               aliases=("prune",), args_hint="[all|recent|task|auto]"),
+    CommandDef("start-tasks", "Define a sequence of tasks to execute sequentially with auto-clear between each", "Session",
+               args_hint="<task1>, <task2>, ..."),
+    CommandDef("end-tasks", "Execute the defined task sequence with automatic context clearing", "Session",
+               aliases=("finish-tasks",)),
 
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",

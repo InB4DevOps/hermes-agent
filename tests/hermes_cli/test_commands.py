@@ -174,12 +174,15 @@ class TestGatewayHelpLines:
         lines = gateway_help_lines()
         assert len(lines) > 10
 
-    def test_excludes_cli_only_commands_without_config_gate(self):
+    def test_excludes_cli_only_commands(self):
         lines = gateway_help_lines()
         joined = "\n".join(lines)
         for cmd in COMMAND_REGISTRY:
-            if cmd.cli_only and not cmd.gateway_config_gate:
-                assert f"`/{cmd.name}" not in joined, \
+            if cmd.cli_only:
+                import re
+                # Match the exact command as a word boundary (e.g. `/clear ` or end of line, not `/clear-context`)
+                pattern = re.escape(f"`/{cmd.name}") + r"(?:\s|`|$)"
+                assert not re.search(pattern, joined), \
                     f"cli_only command /{cmd.name} should not be in gateway help"
 
     def test_includes_alias_note_for_bg(self):

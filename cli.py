@@ -4645,6 +4645,12 @@ class HermesCLI:
                     _cprint(f"  Queued for the next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
                 else:
                     _cprint(f"  Queued: {payload[:80]}{'...' if len(payload) > 80 else ''}")
+        elif canonical == "clear-context":
+            self._handle_clear_context(cmd_original)
+        elif canonical == "start-tasks":
+            self._handle_start_tasks(cmd_original)
+        elif canonical == "end-tasks":
+            self._handle_end_tasks(cmd_original)
         elif canonical == "skin":
             self._handle_skin_command(cmd_original)
         elif canonical == "voice":
@@ -5032,6 +5038,190 @@ class HermesCLI:
 
         thread = threading.Thread(target=run_btw, daemon=True, name=f"btw-{task_id}")
         thread.start()
+
+    def _handle_clear_context(self, cmd: str):
+        """Handle /clear-context [all|recent|task] — partial context reset.
+
+        Usage:
+            /clear-context          # Auto-classify and remove ephemeral messages
+            /clear-context all      # Remove all ephemeral messages
+            /clear-context recent   # Remove last 10 non-system messages
+            /clear-context task     # Same as 'all' (keep task list and user prompts)
+        """
+        from hermes_state import SessionDB
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        parts = cmd.strip().split(maxsplit=1)
+        mode = parts[1].lower() if len(parts) > 1 else "auto"
+
+        if mode not in ("all", "recent", "task", "auto"):
+            _cprint("  Usage: /clear-context [all|recent|task]")
+            _cprint("  - all: Remove all ephemeral messages (tool outputs, file contents)")
+            _cprint("  - recent: Remove last 10 non-system messages")
+            _cprint("  - task: Remove ephemeral messages from completed task window only")
+            return
+
+        # Read from in-memory cache for accurate before-count — database may be stale
+        # or messages may not have been persisted yet. Token estimate reads from DB.
+        before_count = len(self.conversation_history)
+        before_tokens = self._estimate_current_context_tokens()
+
+        if mode == "recent":
+            removed = self._session_db.prune_messages(self.session_id, count=10)
+            _cprint(f"  ✂️  Pruned {removed} recent message(s)")
+        elif mode == "task":
+            removed = self._session_db.clear_task_window_ephemeral_messages(self.session_id)
+            _cprint(f"  🧹 Cleared {removed} task-window ephemeral message(s)")
+        else:
+            removed = self._session_db.clear_ephemeral_messages(self.session_id)
+            _cprint(f"  🧹 Cleared {removed} ephemeral message(s)")
+
+        # Reload conversation history from database to sync in-memory state
+        self.conversation_history = self._session_db.get_messages_as_conversation(self.session_id)
+
+        after_count = len(self.conversation_history)
+        _cprint(f"  Session now has {after_count} message(s) (was {before_count})")
+
+        after_tokens = self._estimate_current_context_tokens()
+        token_diff = before_tokens - after_tokens
+        if token_diff > 0:
+            _cprint(f"  📉 Context reduced by ~{format_token_count_compact(token_diff)} tokens "
+                    f"(~{format_token_count_compact(after_tokens)} remaining)")
+        elif token_diff < 0:
+            _cprint(f"  📈 Context increased by ~{format_token_count_compact(abs(token_diff))} tokens "
+                    f"(~{format_token_count_compact(after_tokens)} total)")
+
+        if self.agent and hasattr(self.agent, 'context_compressor') and self.agent.context_compressor:
+            self.agent.context_compressor.last_prompt_tokens = after_tokens
+
+        if self._app:
+            self._app.invalidate()
+            import time as _tmod
+            _tmod.sleep(0.05)  # brief pause for refresh
+
+    def _handle_start_tasks(self, cmd: str):
+        """Handle /start-tasks — enter task definition mode.
+
+        After this command, user messages are buffered (not sent to model).
+        Run /end-tasks to exit mode and execute the task train.
+        """
+        was_active = self._session_db.is_task_definition_mode_active(self.session_id)
+        if was_active:
+            _cprint("  ⏳ Task definition mode is already active")
+            _cprint("  Type your tasks below, then /end-tasks to execute")
+            return
+
+        self._session_db.enter_task_definition_mode(self.session_id)
+        _cprint("  📋 Task definition mode started")
+        _cprint("  Type each task on a separate line:")
+        _cprint("    Write the API documentation")
+        _cprint("    Add unit tests")
+        _cprint("    Deploy to production")
+        _cprint("  Then type /end-tasks to execute all tasks with auto-clear between each")
+        if self._app:
+            self._app.invalidate()
+
+    def _handle_end_tasks(self, cmd: str):
+        """Handle /end-tasks — exit task definition mode and execute task train."""
+        tasks = self._session_db.get_task_definitions(self.session_id)
+        was_active = self._session_db.is_task_definition_mode_active(self.session_id)
+
+        if not was_active and len(tasks) == 0:
+            _cprint("  No tasks defined")
+            return
+
+        # Exit task definition mode
+        if was_active:
+            self._session_db.exit_task_definition_mode(self.session_id)
+
+        task_count = len(tasks)
+        if task_count == 0:
+            _cprint("  No tasks defined to execute")
+            return
+
+        _cprint(f"  🚀 Starting task train with {task_count} task(s):")
+        for i, task in enumerate(tasks, 1):
+            _cprint(f"    {i}. {task['content'][:60]}...")
+
+        # Execute task train
+        self._execute_task_train(tasks)
+
+        if self._app:
+            self._app.invalidate()
+
+    def _execute_task_train(self, tasks: list):
+        """Execute a sequence of tasks with auto-clear between each.
+
+        Args:
+            tasks: List of task dicts with 'content' key
+        """
+        task_count = len(tasks)
+        self.conversation_history = []  # Clear current conversation history
+
+        for i, task in enumerate(tasks, 1):
+            _cprint(f"\n  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            _cprint(f"  [{i}/{task_count}] Executing: {task['content']}")
+            _cprint(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+
+            # Send task to agent
+            try:
+                response = self.agent.run_conversation(
+                    user_message=task['content'],
+                    system_message=self.system_prompt,
+                    conversation_history=self.conversation_history,
+                    task_id=f"task-{i}-{task_count}"
+                )
+                self.conversation_history = response.get('messages', [])
+
+                _cprint(f"  ✅ Task {i} completed\n")
+            except Exception as e:
+                _cprint(f"  ❌ Task {i} failed: {e}\n")
+                # Continue with next task or abort?
+                continue
+
+            # Auto-clear context after each task (except the last one)
+            if i < task_count:
+                _cprint(f"  🧹 Clearing context before next task...")
+                self._session_db.clear_ephemeral_messages(self.session_id)
+                # Keep only the last assistant response for continuity
+                self.conversation_history = [
+                    msg for msg in self.conversation_history
+                    if msg.get('role') == 'assistant' and msg.get('content')
+                ][-1:] if self.conversation_history else []
+
+        _cprint(f"\n  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        _cprint(f"  ✅ Task train completed: {task_count} task(s) executed")
+        _cprint(f"  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+
+    def _estimate_current_context_tokens(self) -> int:
+        """Estimate total tokens in current context (messages + system prompt + tools).
+        
+        Returns rough token count including all components sent to the API:
+        - System prompt (can be ~15K tokens with skills/personalities)
+        - Session messages (user/assistant/tool messages)
+        - Tool schemas (can be 20-30K tokens with 50+ tools enabled)
+        
+        This provides an accurate estimate of actual context usage, not just
+        session message count.
+        """
+        from agent.model_metadata import estimate_session_token_count_from_rows
+        
+        try:
+            messages = self._session_db.get_messages(self.session_id)
+            
+            tools = None
+            if hasattr(self, 'agent') and self.agent:
+                if hasattr(self.agent, 'tools') and self.agent.tools:
+                    tools = self.agent.tools
+            
+            return estimate_session_token_count_from_rows(
+                messages,
+                system_prompt=self.system_prompt or "",
+                tools=tools,
+            )
+        except Exception as exc:
+            logger.warning("Failed to estimate context tokens: %s", exc)
+            return 0
 
     @staticmethod
     def _try_launch_chrome_debug(port: int, system: str) -> bool:
@@ -7243,6 +7433,30 @@ class HermesCLI:
                     # "Other" selected → switch to freetext
                     self._clarify_freetext = True
                     event.app.invalidate()
+                return
+
+            # --- Task definition mode: buffer messages instead of sending ---
+            if self._session_db.is_task_definition_mode_active(self.session_id):
+                text = event.app.current_buffer.text.strip()
+                if text and not _looks_like_slash_command(text):
+                    # Buffer the task definition
+                    self._session_db.store_task_definition(self.session_id, text)
+                    _cprint(f"  ✓ Task buffered: {text[:60]}{'...' if len(text) > 60 else ''}")
+                    _cprint(f"  Type another task or /end-tasks to execute")
+                    event.app.current_buffer.reset()
+                    event.app.invalidate()
+                elif text and _looks_like_slash_command(text):
+                    # Slash commands go through normally
+                    has_images = bool(self._attached_images)
+                    if text or has_images:
+                        images = list(self._attached_images)
+                        self._attached_images.clear()
+                        event.app.invalidate()
+                        payload = (text, images) if images else text
+                        self._pending_input.put(payload)
+                        event.app.current_buffer.reset(append_to_history=True)
+                else:
+                    event.app.current_buffer.reset()
                 return
 
             # --- Normal input routing ---
